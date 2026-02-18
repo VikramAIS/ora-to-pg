@@ -2394,8 +2394,10 @@ def _deduplicate_select_aliases_in_body(body: str) -> str:
                     new_part = implicit_alias_re.sub(f" AS {out_alias}", part_stripped, count=1)
                     new_parts.append(new_part)
             else:
-                unnamed_col_index[0] += 1
-                new_parts.append(part_stripped + f" AS col_{unnamed_col_index[0]}")
+                # No alias found — leave the expression as-is.
+                # PostgreSQL auto-generates column names for unnamed expressions
+                # (e.g. CASE, function calls, arithmetic) just like Oracle does.
+                new_parts.append(part_stripped)
     new_list = ", ".join(new_parts)
     return body[:start] + new_list + body[end:]
 

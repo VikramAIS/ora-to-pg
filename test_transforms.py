@@ -1026,10 +1026,11 @@ class TestDeduplicateAliases:
         """Alias with $ (e.g. a$customer) must be recognised — no double AS."""
         body = "SELECT cust.customer_name AS a$customer, cust.id FROM t"
         result = mod._deduplicate_select_aliases_in_body(body)
-        assert result.upper().count(" AS ") == 2, f"unexpected AS count: {result}"
         assert "a$customer" in result, f"dollar alias lost: {result}"
         # Must NOT have double AS
         assert "AS a$customer AS" not in result, f"double AS: {result}"
+        # cust.id has no explicit alias and should stay as-is (PG derives column name from the column ref)
+        assert "cust.id" in result, f"cust.id mangled: {result}"
 
 
 # ===========================================================================
