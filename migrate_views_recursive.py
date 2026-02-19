@@ -19,7 +19,8 @@ and optional pip packages: oracledb (Oracle), sqlglot (parse/transpile),
 psycopg2 (PostgreSQL).
 
 Usage:
-  python migrate_views_recursive.py views.txt [options]
+  python migrate_views_recursive.py --view-list views.txt [options]
+  python migrate_views_recursive.py --view-list views.txt --no-execute [options]
 
   views.txt format (one view per line):
     APPS.MY_VIEW_NAME
@@ -100,14 +101,22 @@ ORACLE_EBS_PACKAGES = frozenset({
 
 # PostgreSQL reserved keywords (keep uppercase when lowercasing identifiers)
 PG_RESERVED = frozenset({
-    "all", "and", "any", "as", "asc", "between", "both", "by", "case", "cast",
-    "collate", "coalesce", "cross", "current_date", "current_time", "current_timestamp",
-    "current_user", "desc", "distinct", "else", "end", "except", "exists", "false",
-    "for", "from", "full", "group", "having", "in", "inner", "intersect", "into",
-    "join", "leading", "left", "like", "limit", "localtime", "localtimestamp",
-    "natural", "not", "null", "offset", "on", "or", "order", "outer", "overlaps",
-    "right", "select", "session_user", "similar", "some", "table", "then", "to",
-    "trailing", "true", "union", "unique", "user", "using", "when", "where", "with",
+    "all", "analyse", "analyze", "and", "any", "array", "as", "asc",
+    "asymmetric", "between", "both", "by", "case", "cast", "check",
+    "collate", "coalesce", "column", "constraint", "create", "cross",
+    "current_catalog", "current_date", "current_role", "current_schema",
+    "current_time", "current_timestamp", "current_user", "default",
+    "deferrable", "desc", "distinct", "do", "else", "end", "except",
+    "exists", "false", "fetch", "for", "foreign", "from", "full", "grant",
+    "group", "having", "ilike", "in", "initially", "inner", "intersect",
+    "into", "is", "isnull", "join", "language", "lateral", "leading",
+    "left", "like", "limit", "localtime", "localtimestamp", "natural",
+    "not", "notnull", "null", "offset", "on", "only", "or", "order",
+    "outer", "overlaps", "placing", "primary", "references", "returning",
+    "right", "select", "session_user", "similar", "some", "symmetric",
+    "table", "tablesample", "then", "to", "trailing", "true", "union",
+    "unique", "user", "using", "variadic", "verbose", "when", "where",
+    "window", "with",
 })
 
 
@@ -2490,6 +2499,160 @@ def _lowercase_body_identifiers(body: str) -> str:
     return "".join(result)
 
 
+_COMMENT_ALIAS_BLOCKLIST = frozenset({
+    "todo", "fixme", "note", "hack", "bug", "xxx", "noqa", "noinspection",
+    "nolint", "pragma", "hint", "inline", "suppress", "warning", "deprecated",
+})
+
+_COMMENT_ALIAS_RE = re.compile(
+    r'/\*\s*([a-zA-Z_$#][a-zA-Z0-9_$#]*)\s*\*/'
+)
+
+
+def _sanitize_alias_name(alias: str) -> str:
+    """Clean an alias so it is a valid, safe PostgreSQL identifier.
+
+    - Replaces non-alphanumeric/_ chars (like ``$``, ``#``) with ``_``
+    - Prefixes with ``col_`` if the result starts with a digit or is empty
+    - Double-quotes if the alias is a PostgreSQL reserved word
+    """
+    clean = re.sub(r'[^a-zA-Z0-9_]', '_', alias)
+    if not clean or clean[0].isdigit():
+        clean = "col_" + clean
+    return _quote_alias_if_reserved(clean)
+
+
+def _convert_column_comments_to_aliases(body: str) -> str:
+    """Convert inline ``/* name */`` comments in the SELECT list to ``AS name``.
+
+    Oracle DDL or sqlglot transpilation sometimes produces patterns like::
+
+        expression /* column_name */
+
+    instead of::
+
+        expression AS column_name
+
+    Processing is per-item (split by top-level commas) so that:
+
+    - Comments inside string literals are never touched
+    - ``CAST(x AS int) /* col */`` correctly adds the alias after the cast
+    - An item that already has an explicit ``AS alias`` before the comment
+      gets the comment removed rather than producing a double alias
+    - Common non-alias comment words (TODO, FIXME, …) are skipped
+    """
+    bounds = _find_select_list_bounds(body)
+    if not bounds:
+        return body
+    start, end = bounds
+    select_list = body[start:end]
+
+    parts = _split_top_level_commas(select_list)
+    changed = False
+    new_parts: list[str] = []
+
+    explicit_as_tail_re = re.compile(
+        r'\bAS\s+("?[a-zA-Z_$#][a-zA-Z0-9_$#]*"?)\s*$', re.IGNORECASE,
+    )
+
+    for part in parts:
+        stripped = part.strip()
+        if not stripped:
+            new_parts.append(stripped)
+            continue
+
+        # Collect all /* identifier */ matches in this item (outside strings)
+        # We process only the *last* one as a candidate alias.
+        matches = list(_COMMENT_ALIAS_RE.finditer(stripped))
+        if not matches:
+            new_parts.append(stripped)
+            continue
+
+        last_m = matches[-1]
+        candidate = last_m.group(1).strip()
+
+        # Skip blocklisted words (non-alias comments)
+        if candidate.lower() in _COMMENT_ALIAS_BLOCKLIST:
+            new_parts.append(stripped)
+            continue
+
+        # Check whether the match is inside a string literal.
+        # Count unescaped single-quotes before the match start; odd means inside string.
+        pre = stripped[:last_m.start()]
+        in_string = pre.count("'") % 2 == 1
+        if in_string:
+            new_parts.append(stripped)
+            continue
+
+        alias = _sanitize_alias_name(candidate)
+
+        # Remove the comment first
+        item_no_comment = stripped[:last_m.start()].rstrip() + stripped[last_m.end():]
+        item_no_comment = item_no_comment.strip()
+
+        # If the item already has an explicit AS alias, just drop the comment
+        if explicit_as_tail_re.search(item_no_comment):
+            new_parts.append(item_no_comment)
+        else:
+            new_parts.append(f"{item_no_comment} AS {alias}")
+        changed = True
+
+    if not changed:
+        return body
+    new_list = ", ".join(new_parts)
+    return body[:start] + new_list + body[end:]
+
+
+def _sanitize_select_aliases(body: str) -> str:
+    """Sanitise existing ``AS alias`` tokens in the SELECT list.
+
+    Operates per-item (split by top-level commas) so that ``CAST(x AS int)``
+    inside a select expression is never mistaken for a column alias.
+
+    Fixes applied to each item's trailing ``AS alias``:
+
+    - Special characters (``#``, ``$``) replaced with ``_``
+    - Leading-digit aliases prefixed with ``col_``
+    - PostgreSQL reserved words double-quoted
+    """
+    bounds = _find_select_list_bounds(body)
+    if not bounds:
+        return body
+    start, end = bounds
+    select_list = body[start:end]
+
+    parts = _split_top_level_commas(select_list)
+    changed = False
+    new_parts: list[str] = []
+
+    # Trailing AS alias (unquoted) at end of item
+    trailing_as_re = re.compile(
+        r'^(.*\bAS\s+)([a-zA-Z_$#][a-zA-Z0-9_$#]*)\s*$',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    for part in parts:
+        stripped = part.strip()
+        m = trailing_as_re.match(stripped)
+        if not m:
+            new_parts.append(stripped)
+            continue
+
+        prefix = m.group(1)
+        alias = m.group(2)
+        clean = _sanitize_alias_name(alias)
+        if clean != alias:
+            new_parts.append(prefix + clean)
+            changed = True
+        else:
+            new_parts.append(stripped)
+
+    if not changed:
+        return body
+    new_list = ", ".join(new_parts)
+    return body[:start] + new_list + body[end:]
+
+
 def normalize_view_script(
     pg_ddl: str,
     apply_oracle_conversions: bool = True,
@@ -2533,6 +2696,7 @@ def normalize_view_script(
                 out = fn(b)
                 log.debug("[NORMALIZE] %s done in %.2fs", name, time.perf_counter() - t0)
                 return out
+            body = _norm_step("column_comments_to_aliases", _convert_column_comments_to_aliases, body)
             body = _norm_step("strip_sql_comments", _strip_sql_comments, body)
             body = _norm_step("decode_html_entities", _decode_html_entities_in_body, body)
             body = _norm_step("repair_identifier_space", _repair_identifier_space_before_dot, body)
@@ -2567,6 +2731,7 @@ def normalize_view_script(
             body = _norm_step("empty_string_to_null_datetime", _empty_string_to_null_for_datetime, body)
             body = _norm_step("remove_quotes_from_columns", _remove_quotes_from_columns, body)
             body = _norm_step("deduplicate_select_aliases", _deduplicate_select_aliases_in_body, body)
+            body = _norm_step("sanitize_select_aliases", _sanitize_select_aliases, body)
             body = _norm_step("cast_numeric_string_literals", _cast_numeric_string_literals_in_equality, body)
             body = _norm_step("lowercase_body_identifiers", _lowercase_body_identifiers, body)
             body = _norm_step("ensure_space_before_keywords", _ensure_space_before_keywords, body)
@@ -4612,6 +4777,7 @@ class RecursiveViewMigrator:
         self.failed: set[ViewKey] = set()
         self._in_progress: set[ViewKey] = set()
         self._ensured_schemas: set[str] = set()
+        self._created_functions: set[str] = set()
 
         self.results: list[dict] = []  # per-view result records
         self.stats = {
@@ -4815,6 +4981,370 @@ class RecursiveViewMigrator:
         return ok, err
 
     # ------------------------------------------------------------------
+    # Oracle function/procedure fetch & create on PG
+    # ------------------------------------------------------------------
+
+    def _fetch_function_source_from_oracle(
+        self, owner: str, func_name: str
+    ) -> Optional[str]:
+        """Fetch function/procedure source from Oracle ALL_SOURCE.
+
+        Returns the full source text (lines concatenated), or None.
+        """
+        cursor = self.oracle_conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT text FROM all_source
+                WHERE owner = :o AND name = :n
+                ORDER BY type, line
+                """,
+                {"o": owner.upper(), "n": func_name.upper()},
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                return None
+            return "".join(r[0] if isinstance(r[0], str) else r[0].read() for r in rows)
+        except Exception as e:
+            log.warning("Failed to fetch source for %s.%s: %s", owner, func_name, e)
+            return None
+        finally:
+            cursor.close()
+
+    def _fetch_function_ddl_from_oracle(
+        self, owner: str, func_name: str
+    ) -> Optional[str]:
+        """Fetch full CREATE FUNCTION/PROCEDURE DDL via DBMS_METADATA (preferred)
+        or fall back to ALL_SOURCE.
+        """
+        cursor = self.oracle_conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT object_type FROM all_objects
+                WHERE owner = :o AND object_name = :n
+                  AND object_type IN ('FUNCTION', 'PROCEDURE', 'PACKAGE')
+                AND ROWNUM = 1
+                """,
+                {"o": owner.upper(), "n": func_name.upper()},
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            obj_type = row[0]
+        except Exception:
+            obj_type = "FUNCTION"
+        finally:
+            cursor.close()
+
+        # Try DBMS_METADATA first
+        cursor = self.oracle_conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT DBMS_METADATA.GET_DDL(:otype, :oname, :oowner) FROM DUAL",
+                {"otype": obj_type, "oname": func_name.upper(), "oowner": owner.upper()},
+            )
+            row = cursor.fetchone()
+            if row and row[0]:
+                ddl = row[0] if isinstance(row[0], str) else row[0].read()
+                return ddl.strip()
+        except Exception:
+            pass
+        finally:
+            cursor.close()
+
+        # Fall back to ALL_SOURCE
+        source = self._fetch_function_source_from_oracle(owner, func_name)
+        if source:
+            return f"CREATE OR REPLACE {source}"
+        return None
+
+    def _convert_oracle_function_to_pg(self, ddl: str, owner: str) -> Optional[str]:
+        """Convert Oracle PL/SQL function/procedure to PL/pgSQL.
+
+        Strategy:
+          1. Try sqlglot transpile (Oracle -> Postgres) for the full DDL.
+             sqlglot handles signature syntax (RETURN->RETURNS, type mappings,
+             parameter modes, IS/AS body wrapping) structurally.
+          2. Apply regex-based fixups for anything sqlglot misses or gets wrong
+             (PL/SQL body constructs, Oracle builtins, $$ wrapping).
+          3. If sqlglot fails entirely, fall back to pure regex conversion.
+        """
+        if not ddl:
+            return None
+
+        text = ddl.strip()
+        if text.endswith("/"):
+            text = text[:-1].rstrip()
+
+        # Skip PACKAGE / PACKAGE BODY
+        if re.search(r"\bPACKAGE\b", text, re.IGNORECASE):
+            log.info("Skipping PACKAGE %s.* -- package auto-conversion not supported", owner)
+            return None
+
+        # Normalize CREATE OR REPLACE
+        text = re.sub(
+            r"^\s*CREATE\s+OR\s+REPLACE\s+",
+            "CREATE OR REPLACE ",
+            text, count=1, flags=re.IGNORECASE,
+        )
+        if not re.match(r"CREATE\s+", text, re.IGNORECASE):
+            text = "CREATE OR REPLACE " + text
+
+        # ---- Step 1: sqlglot transpile ----
+        pg_sql = self._sqlglot_transpile_function(text, owner)
+
+        # ---- Step 2 / Fallback: regex fixups ----
+        if pg_sql is None:
+            log.debug("sqlglot transpile failed for %s; falling back to regex conversion", owner)
+            pg_sql = self._regex_convert_function(text, owner)
+
+        if pg_sql is None:
+            return None
+
+        # ---- Step 3: post-processing fixups applied to both paths ----
+        pg_sql = self._postprocess_pg_function(pg_sql, owner)
+        return pg_sql
+
+    def _sqlglot_transpile_function(self, ddl: str, owner: str) -> Optional[str]:
+        """Use sqlglot to transpile an Oracle CREATE FUNCTION/PROCEDURE to Postgres."""
+        try:
+            import sqlglot
+
+            # sqlglot.transpile returns a list of SQL strings
+            results = sqlglot.transpile(ddl, read="oracle", write="postgres")
+            if not results:
+                return None
+            pg_sql = results[0]
+
+            # sqlglot may not wrap PL/pgSQL body in $$ delimiters -- check and fix
+            if "$$" not in pg_sql:
+                pg_sql = self._wrap_plpgsql_body(pg_sql)
+
+            # Force schema to lowercase owner
+            pg_sql = re.sub(
+                r'(CREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\s+)'
+                r'"?' + re.escape(owner.upper()) + r'"?\.',
+                rf"\g<1>{owner.lower()}.",
+                pg_sql, count=1, flags=re.IGNORECASE,
+            )
+            pg_sql = re.sub(
+                r'(CREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\s+)'
+                r'"?' + re.escape(owner) + r'"?\.',
+                rf"\g<1>{owner.lower()}.",
+                pg_sql, count=1, flags=re.IGNORECASE,
+            )
+
+            log.debug("sqlglot transpile succeeded for %s (%d chars)", owner, len(pg_sql))
+            return pg_sql
+        except Exception as e:
+            log.debug("sqlglot transpile error for %s: %s", owner, e)
+            return None
+
+    def _regex_convert_function(self, text: str, owner: str) -> Optional[str]:
+        """Pure regex-based Oracle->PG function conversion (fallback)."""
+        is_function = bool(re.search(r"\bFUNCTION\b", text, re.IGNORECASE))
+
+        # Lowercase owner in the object name
+        text = re.sub(
+            r'(CREATE\s+OR\s+REPLACE\s+(?:FUNCTION|PROCEDURE)\s+)"?' + re.escape(owner) + r'"?\.',
+            rf"\g<1>{owner.lower()}.",
+            text, count=1, flags=re.IGNORECASE,
+        )
+
+        # Find the body boundary: IS|AS (followed by DECLARE or variable decls or BEGIN)
+        body_match = re.search(r"\b(IS|AS)\s*\n", text, re.IGNORECASE)
+        if not body_match:
+            # Try IS/AS followed by anything (single-line)
+            body_match = re.search(r"\b(IS|AS)\s+", text, re.IGNORECASE)
+        if not body_match:
+            return None
+
+        signature = text[:body_match.start()]
+        body_and_rest = text[body_match.end():]
+
+        # Extract RETURN type from signature (Oracle: RETURN type, PG: RETURNS type)
+        return_clause = ""
+        if is_function:
+            ret_match = re.search(r"\bRETURN\s+(\S+)", signature, re.IGNORECASE)
+            if ret_match:
+                return_clause = ret_match.group(1)
+                signature = signature[:ret_match.start()].rstrip() + signature[ret_match.end():]
+
+        # Parameter default := -> DEFAULT
+        signature = re.sub(r"\s*:=\s*", " DEFAULT ", signature)
+
+        # Build PG signature
+        pg_sig = signature.rstrip()
+        if return_clause:
+            pg_sig += f"\nRETURNS {return_clause}"
+
+        pg_sig += "\nLANGUAGE plpgsql\nAS $$\n"
+
+        # Replace END function_name; with END;
+        body_and_rest = re.sub(
+            r"\bEND\s+[a-zA-Z_][a-zA-Z0-9_]*\s*;",
+            "END;",
+            body_and_rest, flags=re.IGNORECASE,
+        )
+        body_and_rest = body_and_rest.rstrip().rstrip(";").rstrip()
+
+        return pg_sig + body_and_rest + ";\n$$;"
+
+    def _wrap_plpgsql_body(self, pg_sql: str) -> str:
+        """If sqlglot output has an IS/AS body but no $$ delimiters, wrap it."""
+        # Find IS|AS boundary
+        m = re.search(r"\b(AS|IS)\s+(?=DECLARE\b|BEGIN\b)", pg_sql, re.IGNORECASE)
+        if not m:
+            m = re.search(r"\b(AS|IS)\s*\n", pg_sql, re.IGNORECASE)
+        if not m:
+            return pg_sql
+
+        before = pg_sql[:m.start()]
+        keyword = m.group(1)
+        after = pg_sql[m.end():]
+
+        # Replace END func_name; with END;
+        after = re.sub(
+            r"\bEND\s+[a-zA-Z_][a-zA-Z0-9_]*\s*;",
+            "END;",
+            after, flags=re.IGNORECASE,
+        )
+        after = after.rstrip().rstrip(";").rstrip()
+
+        # Check if LANGUAGE is already specified
+        if not re.search(r"\bLANGUAGE\b", before, re.IGNORECASE):
+            return before.rstrip() + "\nLANGUAGE plpgsql\nAS $$\n" + after + ";\n$$;"
+        return before.rstrip() + "\nAS $$\n" + after + ";\n$$;"
+
+    def _postprocess_pg_function(self, pg_sql: str, owner: str) -> str:
+        """Apply common fixups to the transpiled PG function DDL."""
+        # Oracle type -> PG type mappings
+        type_map = [
+            (r"\bNUMBER\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\)", lambda m: "NUMERIC" + m.group()[6:] if "," in m.group() else "NUMERIC"),
+            (r"\bNUMBER\b", "NUMERIC"),
+            (r"\bVARCHAR2\s*\([^)]*\)", "TEXT"),
+            (r"\bVARCHAR2\b", "TEXT"),
+            (r"\bNVARCHAR2\s*\([^)]*\)", "TEXT"),
+            (r"\bCLOB\b", "TEXT"),
+            (r"\bNCLOB\b", "TEXT"),
+            (r"\bBLOB\b", "BYTEA"),
+            (r"\bRAW\s*\([^)]*\)", "BYTEA"),
+            (r"\bLONG\s+RAW\b", "BYTEA"),
+            (r"\bLONG\b", "TEXT"),
+            (r"\bPLS_INTEGER\b", "INTEGER"),
+            (r"\bBINARY_INTEGER\b", "INTEGER"),
+            (r"\bSIMPLE_INTEGER\b", "INTEGER"),
+            (r"\bNATURAL\b", "INTEGER"),
+            (r"\bNATURALN\b", "INTEGER"),
+            (r"\bPOSITIVE\b", "INTEGER"),
+            (r"\bPOSITIVEN\b", "INTEGER"),
+            (r"\bSIGNTYPE\b", "INTEGER"),
+        ]
+        for pat, repl in type_map:
+            if callable(repl):
+                pg_sql = re.sub(pat, repl, pg_sql, flags=re.IGNORECASE)
+            else:
+                pg_sql = re.sub(pat, repl, pg_sql, flags=re.IGNORECASE)
+
+        # Oracle %TYPE / %ROWTYPE -> TEXT (safe fallback; real type is unknown)
+        pg_sql = re.sub(r"[a-zA-Z_][a-zA-Z0-9_.]*%TYPE\b", "TEXT", pg_sql, flags=re.IGNORECASE)
+        pg_sql = re.sub(r"[a-zA-Z_][a-zA-Z0-9_.]*%ROWTYPE\b", "RECORD", pg_sql, flags=re.IGNORECASE)
+
+        # Oracle builtins in the body
+        pg_sql = re.sub(r"\bNVL\s*\(", "COALESCE(", pg_sql, flags=re.IGNORECASE)
+        pg_sql = re.sub(r"\bNVL2\s*\(", "/* NVL2 */ COALESCE(", pg_sql, flags=re.IGNORECASE)
+        pg_sql = re.sub(r"\bSYSDATE\b", "CURRENT_TIMESTAMP", pg_sql, flags=re.IGNORECASE)
+        pg_sql = re.sub(r"\bSYSTIMESTAMP\b", "CURRENT_TIMESTAMP", pg_sql, flags=re.IGNORECASE)
+        pg_sql = re.sub(r"\bDBMS_OUTPUT\.PUT_LINE\s*\(", "RAISE NOTICE '%', (", pg_sql, flags=re.IGNORECASE)
+        pg_sql = re.sub(r"\bUSERENV\s*\(\s*'[^']*'\s*\)", "current_setting('application_name')", pg_sql, flags=re.IGNORECASE)
+
+        # Remove Oracle pragmas
+        pg_sql = re.sub(r"\bPRAGMA\s+[^;]+;", "", pg_sql, flags=re.IGNORECASE)
+
+        # Oracle exception names -> PG
+        pg_sql = re.sub(r"\bNO_DATA_FOUND\b", "NO_DATA_FOUND", pg_sql)
+        pg_sql = re.sub(r"\bTOO_MANY_ROWS\b", "TOO_MANY_ROWS", pg_sql)
+        pg_sql = re.sub(r"\bDUP_VAL_ON_INDEX\b", "UNIQUE_VIOLATION", pg_sql, flags=re.IGNORECASE)
+
+        # Oracle RETURN -> PG RETURN (inside body, both work, but ensure consistency)
+        # Oracle: RETURN expr;  PG: RETURN expr;  -- same syntax, no change needed
+
+        # := is valid in PL/pgSQL, no change needed
+
+        # CONCAT operator || is the same in both, no change needed
+
+        # Ensure schema is lowercase
+        pg_sql = re.sub(
+            r'(CREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\s+)"?' + re.escape(owner.upper()) + r'"?\.',
+            rf"\g<1>{owner.lower()}.",
+            pg_sql, count=1, flags=re.IGNORECASE,
+        )
+
+        return pg_sql
+
+    def _resolve_and_create_function(
+        self, func_name_full: str, parent_schema: str
+    ) -> bool:
+        """Fetch a missing function from Oracle, convert to PL/pgSQL, execute on PG.
+
+        func_name_full may be 'schema.func' or just 'func'.
+        Returns True if the function was created successfully.
+        """
+        func_key = func_name_full.lower()
+        if func_key in self._created_functions:
+            return True
+
+        if "." in func_name_full:
+            func_schema, func_name = func_name_full.split(".", 1)
+        else:
+            func_schema = parent_schema if parent_schema else ""
+            func_name = func_name_full
+
+        if not func_schema:
+            log.warning("Cannot resolve function '%s': no schema context", func_name_full)
+            return False
+
+        log.info("Fetching function %s.%s from Oracle...", func_schema, func_name)
+        ddl = self._fetch_function_ddl_from_oracle(func_schema, func_name)
+        if not ddl:
+            log.warning("No source found in Oracle for function %s.%s", func_schema, func_name)
+            return False
+
+        log.info("Converting function %s.%s to PL/pgSQL (%d chars)...", func_schema, func_name, len(ddl))
+        pg_func = self._convert_oracle_function_to_pg(ddl, func_schema)
+        if not pg_func:
+            log.warning("Could not convert function %s.%s to PL/pgSQL", func_schema, func_name)
+            return False
+
+        self._ensure_schema(func_schema.lower())
+
+        log.info("Executing function %s.%s on PostgreSQL...", func_schema.lower(), func_name.lower())
+        try:
+            with self.pg_conn.cursor() as cur:
+                cur.execute(pg_func)
+            self.pg_conn.commit()
+            self._created_functions.add(func_key)
+            self.stats.setdefault("functions_created", 0)
+            self.stats["functions_created"] += 1
+            log.info("Function %s.%s created successfully on PG", func_schema.lower(), func_name.lower())
+
+            # Write the function SQL to output
+            if self.output_dir:
+                func_dir = self.output_dir / "functions"
+                func_dir.mkdir(parents=True, exist_ok=True)
+                safe = re.sub(r'[<>:"/\\|?*]', "_", f"{func_schema}_{func_name}".lower())
+                (func_dir / f"{safe}.sql").write_text(
+                    f"-- Source: {func_schema}.{func_name} (auto-fetched from Oracle)\n\n{pg_func}\n",
+                    encoding="utf-8",
+                )
+            return True
+        except Exception as e:
+            self.pg_conn.rollback()
+            log.warning("Failed to create function %s.%s on PG: %s", func_schema, func_name, str(e)[:300])
+            return False
+
+    # ------------------------------------------------------------------
     # Recursive dependency resolution
     # ------------------------------------------------------------------
 
@@ -5015,9 +5545,29 @@ class RecursiveViewMigrator:
                     continue
                 # Already tried this schema, fall through to give up
 
+            # Check for "function X does not exist" -- fetch from Oracle and create
+            missing_func = _parse_missing_function(err)
+            if missing_func:
+                func_key = f"func|{missing_func}"
+                if func_key not in seen_relations:
+                    seen_relations.add(func_key)
+                    log.info("[%s] Attempt %d: function '%s' does not exist; fetching from Oracle...", display, attempt, missing_func)
+                    if self._resolve_and_create_function(missing_func, schema):
+                        log.info("[%s] Function '%s' created; retrying view...", display, missing_func)
+                        continue
+                    log.warning("[%s] Could not create function '%s'", display, missing_func)
+                # Already tried or failed -- fall through to other checks
+
             # Check for "relation does not exist"
             missing_rel = _parse_missing_relation(err)
             if not missing_rel:
+                # If we had a function error that we couldn't resolve, report it
+                if missing_func:
+                    self._record_result(
+                        schema, view_name, False, "missing_function",
+                        [f"Cannot create function: {missing_func}", err[:500]], final_sql=pg_sql,
+                    )
+                    return False
                 log.warning("[%s] Failed with non-relation error: %s", display, err[:200])
                 self._record_result(schema, view_name, False, "execute_error", [err[:500]], final_sql=pg_sql)
                 return False
@@ -5198,6 +5748,7 @@ class RecursiveViewMigrator:
         print(f"  Total views in PG     : {total_created}", flush=True)
         print(f"  Dependencies resolved : {self.stats['deps_resolved']}", flush=True)
         print(f"  Synonym-views created : {self.stats['synonyms_created']}", flush=True)
+        print(f"  Functions created     : {self.stats.get('functions_created', 0)}", flush=True)
         if self.output_dir:
             print(f"  Output directory      : {self.output_dir}", flush=True)
         print(f"{'='*60}", flush=True)
@@ -5265,8 +5816,17 @@ def main() -> None:
         description="Recursive Oracle-to-PostgreSQL view migrator with automatic dependency resolution.",
     )
     parser.add_argument(
-        "view_list",
+        "--view-list",
+        required=True,
+        metavar="FILE",
         help="Text file with view names (one per line: SCHEMA.VIEW_NAME)",
+    )
+    parser.add_argument(
+        "--no-execute",
+        action="store_true",
+        default=False,
+        help="Only convert and write SQL files to output dir (do not execute on PostgreSQL). "
+             "Files are numbered sequentially in dependency order.",
     )
     parser.add_argument("--oracle-user", default=None, help="Oracle user (or ORACLE_USER env)")
     parser.add_argument("--oracle-password", default=None, help="Oracle password (or ORACLE_PASSWORD env)")
@@ -5279,7 +5839,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         default="migrate_output",
-        help="Output directory for success/failed SQL files (default: migrate_output)",
+        help="Output directory for SQL files (default: migrate_output)",
     )
     parser.add_argument(
         "--step-timeout",
@@ -5291,7 +5851,7 @@ def main() -> None:
         "--auto-remove-columns",
         action="store_true",
         default=False,
-        help="Auto-remove missing columns/functions on PG execution errors",
+        help="Auto-remove missing columns/functions on PG execution errors (ignored with --no-execute)",
     )
     parser.add_argument(
         "--synonym-csv",
@@ -5310,6 +5870,8 @@ def main() -> None:
         help="Optional log file path",
     )
     args = parser.parse_args()
+
+    no_execute = args.no_execute
 
     # -- Logging setup --
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
@@ -5399,7 +5961,124 @@ def main() -> None:
                 log.warning("  Schema %s: cache failed: %s", su, e)
         print(f"  Cached {len(schema_objects_cache)} schema(s).", flush=True)
 
-    # -- Connect to PostgreSQL --
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    t_start = time.perf_counter()
+
+    # ================================================================
+    # --no-execute: convert only, write sequentially numbered SQL files
+    # ================================================================
+    if no_execute:
+        print("\n=== Convert-only mode (--no-execute) ===", flush=True)
+        success_dir = output_dir / "success"
+        failed_dir = output_dir / "failed"
+        success_dir.mkdir(parents=True, exist_ok=True)
+        failed_dir.mkdir(parents=True, exist_ok=True)
+
+        view_keys_lower: set[ViewKey] = {((s or "").lower(), (v or "").lower()) for s, v in view_list}
+        view_keys_by_name: dict[str, list[ViewKey]] = {}
+        for (s, v) in view_keys_lower:
+            view_keys_by_name.setdefault(v, []).append((s, v))
+
+        converted: list[tuple[str, str, str, Optional[str], list[str], set]] = []
+        n_ok = 0
+        n_fail = 0
+        pad = max(3, len(str(len(view_list))))
+
+        for i, (schema, view_name) in enumerate(view_list, 1):
+            display = f"{schema}.{view_name}" if schema else view_name
+            print(f"  [{i:>{pad}}/{len(view_list)}] Converting: {display}", end="", flush=True)
+
+            ddl = _fetch_view_ddl_from_oracle(oracle_conn, schema, view_name)
+            if not ddl:
+                print(" FAIL (no DDL)", flush=True)
+                converted.append((schema, view_name, display, None, ["No DDL found in Oracle"], set()))
+                n_fail += 1
+                continue
+
+            step_sec = args.step_timeout or 0
+            try:
+                pg_sql, warns, err_type, refs = _convert_single_view(
+                    schema, view_name, ddl, synonym_map,
+                    True,  # apply_oracle_conversions
+                    bool(oracle_conn),  # do_qualify
+                    oracle_conn, schema_objects_cache, step_sec,
+                    None,  # qualify_lock
+                    False,  # skip_deps=False to get dependency info
+                    view_keys_lower, view_keys_by_name,
+                )
+                if err_type:
+                    print(f" FAIL ({err_type})", flush=True)
+                    converted.append((schema, view_name, display, None, [w.strip() for w in warns] + [err_type], set()))
+                    n_fail += 1
+                else:
+                    print(" OK", flush=True)
+                    converted.append((schema, view_name, display, pg_sql, [w.strip() for w in warns], refs))
+                    n_ok += 1
+            except Exception as e:
+                print(f" FAIL ({e})", flush=True)
+                converted.append((schema, view_name, display, None, [str(e)], set()))
+                n_fail += 1
+
+        # Topological sort for dependency order
+        views_for_sort = [(s, v) for s, v, *_ in converted]
+        deps_for_sort = [c[5] for c in converted]
+        order = topological_sort(views_for_sort, deps_for_sort)
+        if order != list(range(len(view_list))):
+            print("  Writing in dependency order.", flush=True)
+
+        dep_pad = max(3, len(str(len(order))))
+        error_log_lines: list[str] = []
+
+        for rank, idx in enumerate(order):
+            schema, view_name, display, pg_sql, warns, _ = converted[idx]
+            prefix = f"{(rank + 1):0{dep_pad}d}_"
+            safe_name = f"{schema}_{view_name}".replace(".", "_") if schema else view_name
+            safe_name = re.sub(r'[<>:"/\\|?*]', "_", safe_name)
+
+            if pg_sql:
+                header = f"-- Source: {display}\n"
+                for w in warns:
+                    if w:
+                        header += f"-- WARNING: {w}\n"
+                out_path = success_dir / f"{prefix}{safe_name}.sql"
+                out_path.write_text(header + "\n" + pg_sql + "\n", encoding="utf-8")
+            else:
+                header = f"-- Source: {display}\n"
+                for w in warns:
+                    header += f"-- ERROR: {w}\n"
+                out_path = failed_dir / f"{prefix}{safe_name}.sql"
+                ddl_fallback = _fetch_view_ddl_from_oracle(oracle_conn, schema, view_name) or ""
+                out_path.write_text(header + "\n" + ddl_fallback + "\n", encoding="utf-8")
+                error_log_lines.append(f"{display}\t{'; '.join(warns)[:500]}")
+
+        if error_log_lines:
+            log_path = failed_dir / "error_log.txt"
+            log_path.write_text("view\terror_message\n" + "\n".join(error_log_lines) + "\n", encoding="utf-8")
+
+        elapsed = time.perf_counter() - t_start
+        print(f"\n{'='*60}", flush=True)
+        print(f"Convert-only Summary (--no-execute)", flush=True)
+        print(f"{'='*60}", flush=True)
+        print(f"  Total views       : {len(view_list)}", flush=True)
+        print(f"  Converted OK      : {n_ok}", flush=True)
+        print(f"  Failed            : {n_fail}", flush=True)
+        print(f"  Success dir       : {success_dir}", flush=True)
+        print(f"  Failed dir        : {failed_dir}", flush=True)
+        print(f"  Total time        : {elapsed:.1f}s ({elapsed/60:.1f} min)", flush=True)
+        print(f"{'='*60}", flush=True)
+
+        try:
+            oracle_conn.close()
+        except Exception:
+            pass
+        if n_fail > 0:
+            sys.exit(1)
+        return
+
+    # ================================================================
+    # Execute mode (default): convert + execute on PG with dep resolution
+    # ================================================================
     print(f"Connecting to PostgreSQL ({pg_host}:{pg_port}/{pg_database})...", flush=True)
     try:
         import psycopg2
@@ -5417,10 +6096,6 @@ def main() -> None:
         sys.exit(1)
     print("  PostgreSQL connected.", flush=True)
 
-    # -- Run migration --
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     migrator = RecursiveViewMigrator(
         oracle_conn=oracle_conn,
         pg_conn=pg_conn,
@@ -5431,7 +6106,6 @@ def main() -> None:
         output_dir=output_dir,
     )
 
-    t_start = time.perf_counter()
     migrator.migrate_all(view_list)
     elapsed = time.perf_counter() - t_start
 

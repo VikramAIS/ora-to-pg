@@ -2020,5 +2020,363 @@ class TestRemoveRelationReferences:
         assert "t1.active = 1" in result
 
 
+# ===========================================================================
+# Import the standalone migration script for testing the new functions
+# ===========================================================================
+import migrate_views_recursive as mrv
+
+
+# ===========================================================================
+# _sanitize_alias_name
+# ===========================================================================
+class TestSanitizeAliasName:
+    """Unit tests for the shared alias sanitiser helper."""
+
+    def test_plain_identifier_unchanged(self):
+        assert mrv._sanitize_alias_name("customer_id") == "customer_id"
+
+    def test_dollar_sign_replaced(self):
+        assert mrv._sanitize_alias_name("a$col") == "a_col"
+
+    def test_hash_sign_replaced(self):
+        assert mrv._sanitize_alias_name("col#1") == "col_1"
+
+    def test_leading_digit_prefixed(self):
+        result = mrv._sanitize_alias_name("1total")
+        assert result.startswith("col_")
+        assert "1total" in result
+
+    def test_all_special_chars_becomes_underscores(self):
+        result = mrv._sanitize_alias_name("$#$")
+        assert result == "___"  # valid: starts with _, no prefix needed
+
+    def test_reserved_word_quoted(self):
+        result = mrv._sanitize_alias_name("language")
+        assert result == '"language"'
+
+    def test_select_reserved_quoted(self):
+        result = mrv._sanitize_alias_name("select")
+        assert result == '"select"'
+
+    def test_column_reserved_quoted(self):
+        result = mrv._sanitize_alias_name("column")
+        assert result == '"column"'
+
+    def test_non_reserved_not_quoted(self):
+        result = mrv._sanitize_alias_name("customer_name")
+        assert result == "customer_name"
+        assert '"' not in result
+
+    def test_combined_clean_and_reserved_check(self):
+        # $end -> _end: underscore prefix means it's no longer the keyword "end"
+        result = mrv._sanitize_alias_name("$end")
+        assert result == "_end"
+
+    def test_bare_reserved_after_clean(self):
+        # #end -> _end (not reserved), but just "end" is reserved
+        result = mrv._sanitize_alias_name("end")
+        assert result == '"end"'
+
+
+# ===========================================================================
+# _convert_column_comments_to_aliases
+# ===========================================================================
+class TestConvertColumnCommentsToAliases:
+    """Tests for /* name */ -> AS name conversion in SELECT lists."""
+
+    def _body(self, select_expr: str, from_clause: str = "FROM t") -> str:
+        return f"SELECT {select_expr} {from_clause}"
+
+    # --- Basic conversion ---
+
+    def test_single_comment_alias(self):
+        body = self._body("a.col1 /* language */")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert '/* language */' not in result
+        assert 'AS "language"' in result  # 'language' is PG reserved
+
+    def test_multiple_comment_aliases(self):
+        body = self._body("a.col1 /* name */, b.col2 /* status */")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert "/* name */" not in result
+        assert "/* status */" not in result
+        assert "AS name" in result
+        assert "AS status" in result
+
+    def test_comment_with_special_chars_sanitised(self):
+        body = self._body("a.x /* col$1 */")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert "AS col_1" in result
+
+    def test_comment_with_reserved_word_quoted(self):
+        body = self._body("expr1 /* table */")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert 'AS "table"' in result
+
+    # --- No-op / passthrough cases ---
+
+    def test_no_comments_no_change(self):
+        body = self._body("a.col1 AS name, b.col2 AS status")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert result == body
+
+    def test_no_select_returns_unchanged(self):
+        body = "INSERT INTO t VALUES (1)"
+        assert mrv._convert_column_comments_to_aliases(body) == body
+
+    def test_blocklisted_comment_skipped(self):
+        body = self._body("a.col1 /* TODO */")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert "/* TODO */" in result  # left as comment
+        assert "AS TODO" not in result.upper()
+
+    def test_fixme_comment_skipped(self):
+        body = self._body("a.col1 /* FIXME */")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert "/* FIXME */" in result
+
+    # --- String literal safety ---
+
+    def test_comment_inside_string_literal_not_touched(self):
+        body = self._body("'hello /* world */' AS greeting")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert "'hello /* world */'" in result
+
+    # --- Double-alias prevention ---
+
+    def test_existing_alias_comment_dropped_no_double(self):
+        body = self._body("expr AS name /* old_name */")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert "/* old_name */" not in result
+        assert "AS name" in result
+        # Must NOT have double AS
+        assert result.count(" AS ") == 1 or "AS name AS" not in result
+
+    def test_existing_quoted_alias_comment_dropped(self):
+        body = self._body('expr AS "MyCol" /* legacy */')
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert "/* legacy */" not in result
+        assert '"MyCol"' in result
+
+    # --- CAST / parentheses ---
+
+    def test_cast_not_broken(self):
+        body = self._body("CAST(a.x AS integer) /* col_x */")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert "CAST(a.x AS integer)" in result
+        assert "AS col_x" in result
+        assert "/* col_x */" not in result
+
+    # --- Edge cases ---
+
+    def test_multiword_comment_not_converted(self):
+        """Only single-identifier comments are candidates."""
+        body = self._body("a.col /* this is a note */")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert "/* this is a note */" in result
+
+    def test_whitespace_around_identifier(self):
+        body = self._body("a.col /*   status   */")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert "AS status" in result
+
+    def test_star_item_with_comment_converted(self):
+        """Even *.col /* alias */ should get converted (unlikely but safe)."""
+        body = self._body("a.col1 /* name */, b.*")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert "AS name" in result
+        assert "b.*" in result
+
+    def test_empty_select_list_no_crash(self):
+        body = "SELECT  FROM t"
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert result == body
+
+    def test_subquery_comment_in_item(self):
+        body = self._body("(SELECT max(id) FROM sub) /* max_id */")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert "AS max_id" in result
+        assert "/* max_id */" not in result
+
+    def test_multiple_comments_in_one_item_uses_last(self):
+        """Only the last /* id */ in an item is treated as the alias."""
+        body = self._body("/* NOTE */ a.col /* status */")
+        result = mrv._convert_column_comments_to_aliases(body)
+        assert "AS status" in result
+        # The first comment (NOTE) is blocklisted but we only process last anyway
+        assert "AS NOTE" not in result.upper()
+
+
+# ===========================================================================
+# _sanitize_select_aliases
+# ===========================================================================
+class TestSanitizeSelectAliases:
+    """Tests for alias sanitisation in the SELECT list."""
+
+    def _body(self, select_expr: str, from_clause: str = "FROM t") -> str:
+        return f"SELECT {select_expr} {from_clause}"
+
+    # --- Basic sanitisation ---
+
+    def test_reserved_word_alias_quoted(self):
+        body = self._body("a.col AS language")
+        result = mrv._sanitize_select_aliases(body)
+        assert 'AS "language"' in result
+
+    def test_column_reserved_word_quoted(self):
+        body = self._body("a.x AS column")
+        result = mrv._sanitize_select_aliases(body)
+        assert 'AS "column"' in result
+
+    def test_dollar_in_alias_cleaned(self):
+        body = self._body("a.x AS a$col")
+        result = mrv._sanitize_select_aliases(body)
+        assert "AS a_col" in result
+        assert "$" not in result
+
+    def test_hash_in_alias_cleaned(self):
+        body = self._body("a.x AS col#name")
+        result = mrv._sanitize_select_aliases(body)
+        assert "AS col_name" in result
+
+    def test_clean_alias_unchanged(self):
+        body = self._body("a.x AS customer_name")
+        result = mrv._sanitize_select_aliases(body)
+        assert result == body
+
+    # --- CAST safety ---
+
+    def test_cast_as_type_not_touched(self):
+        """CAST(x AS integer) must not be mistaken for an alias."""
+        body = self._body("CAST(a.x AS integer) AS col_x")
+        result = mrv._sanitize_select_aliases(body)
+        assert "CAST(a.x AS integer)" in result
+        assert "AS col_x" in result
+
+    def test_cast_as_date_not_touched(self):
+        body = self._body("CAST(a.x AS date) AS my_date")
+        result = mrv._sanitize_select_aliases(body)
+        assert "CAST(a.x AS date)" in result
+
+    def test_nested_cast_not_touched(self):
+        body = self._body("CAST(CAST(a.x AS text) AS varchar) AS col_x")
+        result = mrv._sanitize_select_aliases(body)
+        assert "CAST(CAST(a.x AS text) AS varchar)" in result
+        assert "AS col_x" in result
+
+    # --- No-op cases ---
+
+    def test_no_aliases_no_change(self):
+        body = self._body("a.col1, b.col2")
+        result = mrv._sanitize_select_aliases(body)
+        assert result == body
+
+    def test_already_quoted_alias_no_change(self):
+        body = self._body('a.col AS "MyAlias"')
+        result = mrv._sanitize_select_aliases(body)
+        assert result == body
+
+    def test_no_select_returns_unchanged(self):
+        body = "INSERT INTO t VALUES (1)"
+        assert mrv._sanitize_select_aliases(body) == body
+
+    # --- Multiple items ---
+
+    def test_multiple_items_sanitised(self):
+        body = self._body("a.x AS language, b.y AS status, c.z AS table")
+        result = mrv._sanitize_select_aliases(body)
+        assert 'AS "language"' in result
+        assert "AS status" in result
+        assert 'AS "table"' in result
+
+    def test_mixed_clean_and_dirty(self):
+        body = self._body("a.x AS col$1, b.y AS name, c.z AS end")
+        result = mrv._sanitize_select_aliases(body)
+        assert "AS col_1" in result
+        assert "AS name" in result
+        assert 'AS "end"' in result
+
+    # --- Edge cases ---
+
+    def test_case_insensitive_as(self):
+        body = self._body("a.x as language")
+        result = mrv._sanitize_select_aliases(body)
+        assert '"language"' in result
+
+    def test_alias_with_leading_digit_after_clean(self):
+        """$1col -> _1col: starts with _ which is fine."""
+        body = self._body("a.x AS $1col")
+        result = mrv._sanitize_select_aliases(body)
+        assert "$" not in result
+        assert "_1col" in result
+
+
+# ===========================================================================
+# _quote_alias_if_reserved (expanded PG_RESERVED)
+# ===========================================================================
+class TestQuoteAliasIfReserved:
+    """Verify new PG_RESERVED additions are correctly quoted."""
+
+    @pytest.mark.parametrize("word", [
+        "language", "column", "primary", "references", "returning",
+        "window", "fetch", "grant", "check", "foreign", "do",
+        "initially", "deferrable", "array", "lateral", "only",
+        "analyse", "analyze", "ilike", "is", "isnull", "notnull",
+        "placing", "symmetric", "asymmetric", "variadic", "verbose",
+        "tablesample",
+    ])
+    def test_new_reserved_words_quoted(self, word):
+        result = mrv._quote_alias_if_reserved(word)
+        assert result == f'"{word}"', f"{word} should be quoted"
+
+    @pytest.mark.parametrize("word", [
+        "customer_name", "amount", "status", "total", "my_col",
+    ])
+    def test_non_reserved_not_quoted(self, word):
+        result = mrv._quote_alias_if_reserved(word)
+        assert result == word
+
+
+# ===========================================================================
+# Integration: normalize_view_script pipeline
+# ===========================================================================
+class TestCommentAliasInPipeline:
+    """End-to-end tests through normalize_view_script."""
+
+    def test_comment_converted_and_alias_sanitised(self):
+        ddl = (
+            'CREATE OR REPLACE VIEW apps.test_view AS\n'
+            'SELECT a.col1 /* language */, b.col2 /* status */ FROM my_table a, other_table b;'
+        )
+        result = mrv.normalize_view_script(ddl, apply_oracle_conversions=True)
+        assert "/* language */" not in result
+        assert "/* status */" not in result
+        # 'language' is reserved; pipeline lowercases body then quotes reserved words
+        result_lower = result.lower()
+        assert '"language"' in result_lower
+        assert "status" in result_lower
+
+    def test_comment_alias_with_cast(self):
+        ddl = (
+            'CREATE OR REPLACE VIEW test_view AS\n'
+            'SELECT CAST(a.x AS integer) /* col_x */ FROM t a;'
+        )
+        result = mrv.normalize_view_script(ddl, apply_oracle_conversions=True)
+        assert "/* col_x */" not in result
+        assert "col_x" in result
+        assert "integer" in result
+
+    def test_no_double_alias(self):
+        ddl = (
+            'CREATE OR REPLACE VIEW test_view AS\n'
+            'SELECT a.name AS customer /* old_alias */ FROM t a;'
+        )
+        result = mrv.normalize_view_script(ddl, apply_oracle_conversions=True)
+        assert "/* old_alias */" not in result
+        upper = result.upper()
+        # Should not have AS ... AS
+        assert "AS CUSTOMER AS" not in upper
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
