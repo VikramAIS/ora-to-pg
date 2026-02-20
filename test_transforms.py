@@ -2485,14 +2485,24 @@ class TestViewColumnListPreservation:
         pg = "CREATE OR REPLACE VIEW apps.v AS SELECT t1.a FROM table1 t1, table2 t2, table3 t3"
         cache = {"APPS": {"TABLE1": "TABLE", "TABLE2": "TABLE", "TABLE3": "TABLE"}}
         r = mrv.apply_qualify_unqualified_refs(pg, "apps", None, cache)
-        # All three comma-separated tables must be qualified (APPS: prefix from chars before first _)
-        assert "table1.table1" in r or ".table1" in r
-        assert "table2.table2" in r or ".table2" in r
-        assert "table3.table3" in r or ".table3" in r
+        # Tables exist in view schema (APPS) -> use apps.tableN
+        assert "apps.table1" in r or ".table1" in r
+        assert "apps.table2" in r or ".table2" in r
+        assert "apps.table3" in r or ".table3" in r
         # Aliases preserved
         assert " t1," in r or " t1 " in r
         assert " t2," in r or " t2 " in r
         assert " t3" in r
+
+    def test_qualify_view_schema_first_then_prefix(self):
+        """Ref in view schema -> view_schema.ref; ref not in view schema but in prefix -> prefix.ref."""
+        pg = "CREATE OR REPLACE VIEW apps.v AS SELECT x FROM my_view, ar_items"
+        cache = {"APPS": {"MY_VIEW": "VIEW"}, "AR": {"AR_ITEMS": "TABLE"}}
+        r = mrv.apply_qualify_unqualified_refs(pg, "apps", None, cache)
+        # my_view in APPS -> apps.my_view
+        assert "apps.my_view" in r or "my_view" in r
+        # ar_items NOT in APPS, but in AR (prefix) -> ar.ar_items
+        assert "ar.ar_items" in r or ".ar_items" in r
 
     def test_qualify_does_not_touch_select_list_columns(self):
         """SELECT a, table1 FROM t - table1 in SELECT is column ref, must not be qualified."""

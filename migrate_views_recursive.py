@@ -2976,10 +2976,11 @@ def _qualify_unqualified_refs_in_body(
     Qualify unqualified table/view refs in body using Oracle object type and APPS/APPS2 rules.
     Skip qualification for refs that exist as PUBLIC synonyms (or as view/synonym in source);
     those stay unqualified so dependency resolution can convert and execute them first.
+    Priority: first check if ref exists in view_schema; only apply APPS/APPS2 prefix rules if not found.
     - If ref is in synonym_map (PUBLIC synonym): leave unqualified (dependency resolution handles it)
-    - Else if unqualified ref is a VIEW in Oracle (in view_schema): use view_schema.ref
-    - Else if unqualified ref is a TABLE and view_schema is APPS: use prefix.ref where prefix = chars before first _
-    - Else if unqualified ref is a TABLE and view_schema is APPS2: use prefix2.ref (prefix + '2')
+    - Else if ref exists in view_schema (VIEW or TABLE): use view_schema.ref
+    - Else if view_schema is APPS and ref found in prefix schema (chars before first _): use prefix.ref
+    - Else if view_schema is APPS2 and ref found in prefix2 schema: use prefix2.ref
     - Otherwise leave unqualified.
     When schema_objects_cache is provided, uses it instead of per-ref Oracle queries.
     """
@@ -3001,20 +3002,32 @@ def _qualify_unqualified_refs_in_body(
             obj_type = schema_objs.get(ref_upper)
         else:
             obj_type = get_oracle_object_type(connection, view_schema_upper, ref_upper)
-        if obj_type == "VIEW":
+        if obj_type:
+            # Ref exists in view_schema (VIEW or TABLE) -> use view_schema.ref
             qual = f"{view_schema_upper.lower()}.{ref}"
             replacement_map[ref] = qual
-        elif obj_type == "TABLE":
-            if view_schema_upper == "APPS":
-                prefix = ref.split("_", 1)[0] if "_" in ref else ref
+        elif view_schema_upper == "APPS":
+            prefix = ref.split("_", 1)[0] if "_" in ref else ref
+            prefix_u = prefix.upper()
+            prefix_objs = (schema_objects_cache or {}).get(prefix_u) if schema_objects_cache else None
+            if prefix_objs is not None:
+                prefix_type = prefix_objs.get(ref_upper)
+            else:
+                prefix_type = get_oracle_object_type(connection, prefix_u, ref_upper) if connection else None
+            if prefix_type == "TABLE" or prefix_type == "VIEW":
                 qual = f"{prefix.lower()}.{ref}"
                 replacement_map[ref] = qual
-            elif view_schema_upper == "APPS2":
-                prefix = ref.split("_", 1)[0] if "_" in ref else ref
+        elif view_schema_upper == "APPS2":
+            prefix = ref.split("_", 1)[0] if "_" in ref else ref
+            prefix2_u = (prefix.upper() + "2")
+            prefix2_objs = (schema_objects_cache or {}).get(prefix2_u) if schema_objects_cache else None
+            if prefix2_objs is not None:
+                prefix2_type = prefix2_objs.get(ref_upper)
+            else:
+                prefix2_type = get_oracle_object_type(connection, prefix2_u, ref_upper) if connection else None
+            if prefix2_type == "TABLE" or prefix2_type == "VIEW":
                 qual = f"{prefix.lower()}2.{ref}"
                 replacement_map[ref] = qual
-            # else: leave unqualified (no replacement)
-        # else: not found or other type, leave unqualified
 
     if not replacement_map:
         return body
