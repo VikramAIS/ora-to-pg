@@ -2658,6 +2658,7 @@ def normalize_view_script(
     apply_oracle_conversions: bool = True,
     orig_schema: str = "",
     orig_view_name: str = "",
+    orig_column_list: str | None = None,
 ) -> str:
     """
     Normalize view DDL to: CREATE OR REPLACE VIEW name AS body;
@@ -2746,13 +2747,29 @@ def normalize_view_script(
     body = body.replace("pg_to_timestamp__(", "to_timestamp(")
 
     # Preserve explicit column list (col1, col2) when present
+    # Use orig_column_list if sqlglot/rewrite dropped it from pg_ddl
+    # Column names are lowercased; reserved words and names with spaces/special chars are quoted.
     column_list_suffix = " "
-    if column_list_raw:
-        col_content = column_list_raw.strip().strip("()").strip()
+    col_list_source = column_list_raw or orig_column_list
+    if col_list_source:
+        col_content = col_list_source.strip().strip("()").strip()
         if col_content:
             col_parts = [c.strip() for c in col_content.split(",") if c.strip()]
             if col_parts:
-                col_normalized = _lowercase_body_identifiers(", ".join(col_parts))
+                normalized_cols = []
+                for c in col_parts:
+                    bare = c.strip('"').strip()
+                    lower = bare.lower()
+                    # Quote if reserved, has spaces, or other non-identifier chars
+                    needs_quote = (
+                        lower in PG_RESERVED
+                        or re.search(r"[^a-zA-Z0-9_]", lower)
+                        or not lower
+                    )
+                    if not lower:
+                        lower = "col"
+                    normalized_cols.append(f'"{lower}"' if needs_quote else lower)
+                col_normalized = ", ".join(normalized_cols)
                 column_list_suffix = f" ({col_normalized}) "
 
     return f"CREATE OR REPLACE VIEW {view_name}{column_list_suffix}AS\n{body}\n;"
@@ -4560,6 +4577,11 @@ _NORMALIZE_CREATE_VIEW_PATTERN = re.compile(
     r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:FORCE\s+)?VIEW\s+(.+?)\s+(\([^)]*\)\s+)?AS\s+(.*)",
     re.IGNORECASE | re.DOTALL,
 )
+# Extract column list from raw DDL (used when sqlglot drops it during transpilation)
+_EXTRACT_ORIG_COLUMN_LIST_PATTERN = re.compile(
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:FORCE\s+)?VIEW\s+\S+\s+(\([^)]*\))\s+AS\b",
+    re.IGNORECASE | re.DOTALL,
+)
 # Pattern to replace only the view name in CREATE VIEW ... name ... AS (used to force original schema.viewname)
 _REWRITE_VIEW_NAME_PATTERN = re.compile(
     r"(CREATE\s+(?:OR\s+REPLACE\s+)?(?:FORCE\s+)?VIEW\s+)(.+?)(\s+(?:\([^)]*\)\s+)?AS\s+)",
@@ -4842,6 +4864,12 @@ def _convert_single_view(
     """
     warning_lines: list[str] = []
 
+    # Extract column list from original DDL before rewrite (sqlglot may drop it)
+    orig_column_list: str | None = None
+    m_col = _EXTRACT_ORIG_COLUMN_LIST_PATTERN.search(_first_statement_only(ddl))
+    if m_col:
+        orig_column_list = m_col.group(1).strip()
+
     # Step 1: rewrite (sqlglot parse + synonym replacement + transpile)
     rewrite_failed = False
     try:
@@ -4859,7 +4887,10 @@ def _convert_single_view(
         rewrite_failed = True
 
     # Step 2: normalize (Oracle->PG body conversions)
-    ok, res = _run_with_step_timeout(step_sec, normalize_view_script, pg_sql, apply_oracle_conversions, orig_schema=schema, orig_view_name=view_name)
+    ok, res = _run_with_step_timeout(
+        step_sec, normalize_view_script, pg_sql, apply_oracle_conversions,
+        orig_schema=schema, orig_view_name=view_name, orig_column_list=orig_column_list,
+    )
     if not ok:
         display = f"{schema}.{view_name}" if schema else view_name
         log.warning("[VIEW %s] normalize TIMEOUT after %ds, skipping normalize", display, step_sec or 15)
@@ -4917,6 +4948,7 @@ class RecursiveViewMigrator:
         schema_objects_cache: dict[str, dict[str, str]],
         step_timeout: int = 15,
         auto_remove_columns: bool = False,
+        no_qualify: bool = False,
         output_dir: Optional[Path] = None,
     ):
         self.oracle_conn = oracle_conn
@@ -4925,6 +4957,7 @@ class RecursiveViewMigrator:
         self.schema_objects_cache = schema_objects_cache
         self.step_timeout = step_timeout
         self.auto_remove_columns = auto_remove_columns
+        self.no_qualify = no_qualify
         self.output_dir = output_dir
 
         self.created: set[ViewKey] = set()
@@ -5078,7 +5111,7 @@ class RecursiveViewMigrator:
                 ddl,
                 self.synonym_map,
                 True,  # apply_oracle_conversions
-                bool(self.oracle_conn),  # do_qualify
+                bool(self.oracle_conn) and not self.no_qualify,  # do_qualify
                 self.oracle_conn,
                 self.schema_objects_cache,
                 self.step_timeout,
@@ -5971,6 +6004,12 @@ def main() -> None:
         help="Only convert and write SQL files to output dir (do not execute on PostgreSQL). "
              "Files are numbered sequentially in dependency order.",
     )
+    parser.add_argument(
+        "--no-qualify",
+        action="store_true",
+        default=False,
+        help="Skip qualifying unqualified table/view refs with schema (default: qualify when Oracle connected).",
+    )
     parser.add_argument("--oracle-user", default=None, help="Oracle user (or ORACLE_USER env)")
     parser.add_argument("--oracle-password", default=None, help="Oracle password (or ORACLE_PASSWORD env)")
     parser.add_argument("--oracle-dsn", default=None, help="Oracle DSN (or ORACLE_DSN env, default: localhost:1521/ORCL)")
@@ -6144,7 +6183,7 @@ def main() -> None:
                 pg_sql, warns, err_type, refs = _convert_single_view(
                     schema, view_name, ddl, synonym_map,
                     True,  # apply_oracle_conversions
-                    bool(oracle_conn),  # do_qualify
+                    bool(oracle_conn) and not args.no_qualify,  # do_qualify
                     oracle_conn, schema_objects_cache, step_sec,
                     None,  # qualify_lock
                     False,  # skip_deps=False to get dependency info
@@ -6246,6 +6285,7 @@ def main() -> None:
         schema_objects_cache=schema_objects_cache,
         step_timeout=args.step_timeout,
         auto_remove_columns=args.auto_remove_columns,
+        no_qualify=args.no_qualify,
         output_dir=output_dir,
     )
 
