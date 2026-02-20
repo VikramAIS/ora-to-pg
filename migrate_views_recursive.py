@@ -2471,6 +2471,39 @@ def _decode_html_entities_in_body(body: str) -> str:
     return body
 
 
+def _fix_primary_reserved_alias(body: str) -> str:
+    """
+    Oracle uses PRIMARY as a table alias (e.g. FROM apps.ap_checks AS PRIMARY).
+    PostgreSQL reserves PRIMARY, causing 'syntax error at or near PRIMARY'.
+    Quote the alias: AS PRIMARY -> AS "PRIMARY", and PRIMARY. -> "PRIMARY". for qualifier refs.
+    """
+    # Quote alias in FROM: AS PRIMARY
+    body = re.sub(r'\bAS\s+PRIMARY\b', 'AS "PRIMARY"', body, flags=re.IGNORECASE)
+    # Quote PRIMARY when used as qualifier (PRIMARY.column)
+    body = re.sub(r'\bPRIMARY\s*\.', '"PRIMARY".', body, flags=re.IGNORECASE)
+    return body
+
+
+def _fix_select_distinct_as(body: str) -> str:
+    """
+    Fix invalid 'SELECT DISTINCT AS colname' (or 'SELECT AS colname') when the first
+    expression was removed (e.g. ROWID/function), leaving a bare AS. Insert NULL as placeholder.
+    """
+    body = re.sub(r'\bSELECT\s+DISTINCT\s+AS\s+', 'SELECT DISTINCT NULL AS ', body, flags=re.IGNORECASE)
+    body = re.sub(r'\bSELECT\s+AS\s+', 'SELECT NULL AS ', body, flags=re.IGNORECASE)
+    return body
+
+
+def _fix_null_text_as_null_text(body: str) -> str:
+    """
+    Fix invalid 'NULL::text AS NULL::text' produced when ctid (from Oracle ROWID) appears
+    as both expression and alias. Replace with valid NULL::text AS row_id.
+    Applied proactively during normalization so views that never hit ctid-retry still parse.
+    """
+    body = re.sub(r'NULL\s*::\s*text\s+AS\s+NULL\s*::\s*text\b', 'NULL::text AS row_id', body, flags=re.IGNORECASE)
+    return body
+
+
 def _repair_identifier_space_before_dot(body: str) -> str:
     """
     Repair identifier corruption where a space was inserted in an alias/table name (e.g. seg order.ctid -> seg_order.ctid),
@@ -2716,6 +2749,9 @@ def normalize_view_script(
             body = _norm_step("column_comments_to_aliases", _convert_column_comments_to_aliases, body)
             body = _norm_step("strip_sql_comments", _strip_sql_comments, body)
             body = _norm_step("decode_html_entities", _decode_html_entities_in_body, body)
+            body = _norm_step("fix_null_text_as_alias", _fix_null_text_as_null_text, body)
+            body = _norm_step("fix_primary_alias", _fix_primary_reserved_alias, body)
+            body = _norm_step("fix_select_distinct_as", _fix_select_distinct_as, body)
             body = _norm_step("repair_identifier_space", _repair_identifier_space_before_dot, body)
             body = _norm_step("remove_outer_join_plus", _remove_outer_join_plus, body)
             body = _norm_step("nvl_nvl2_decode", _replace_nvl_nvl2_decode_in_body, body)
@@ -3516,20 +3552,27 @@ def _replace_ctid_with_null(sql: str, qualifier: str) -> Optional[str]:
     the column entirely (which changes the view's column count), this replaces
     the reference with ``NULL::text`` so the column position is preserved.
 
+    When Oracle had ROWID AS ROWID, both become ctid; replacing both yields invalid
+    ``NULL::text AS NULL::text``. We first replace ``ctid AS ctid`` with
+    ``NULL::text AS row_id`` so the alias stays valid. Then replace remaining ctid.
+
     Returns the modified SQL, or None if no replacement was made.
     """
     original = sql
+    # 1. Fix ctid AS ctid -> NULL::text AS row_id (avoid invalid NULL::text AS NULL::text)
+    sql = re.sub(r'\bctid\s+AS\s+ctid\b', 'NULL::text AS row_id', sql, flags=re.IGNORECASE)
+    # 2. Replace remaining qualifier.ctid or bare ctid (excluding ctid in alias position)
     if qualifier:
-        # Replace qualifier.ctid with NULL::text
         pat = re.compile(
             r'\b' + re.escape(qualifier) + r'\s*\.\s*ctid\b',
             re.IGNORECASE,
         )
+        sql = pat.sub('NULL::text', sql)
     else:
-        # Replace bare ctid with NULL::text (but not part of a larger identifier)
-        pat = re.compile(r'\bctid\b', re.IGNORECASE)
-
-    sql = pat.sub('NULL::text', sql)
+        # Replace bare ctid, but NOT when it's an alias (after AS) — would produce invalid alias
+        # Match ctid only when not preceded by "AS " (negative lookbehind)
+        pat = re.compile(r'(?<!AS\s)\bctid\b', re.IGNORECASE)
+        sql = pat.sub('NULL::text', sql)
     if sql.strip() == original.strip():
         return None
     return sql

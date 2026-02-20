@@ -348,6 +348,36 @@ class TestReplaceCtidWithNull:
         sql = "SELECT a, b FROM t"
         assert mod._replace_ctid_with_null(sql, "sh") is None
 
+    def test_ctid_as_ctid_becomes_null_as_row_id(self):
+        """Oracle ROWID AS ROWID -> ctid AS ctid; replace yields NULL::text AS row_id (not invalid NULL::text AS NULL::text)."""
+        sql = "SELECT ctid AS ctid FROM t"
+        result = mod._replace_ctid_with_null(sql, "")
+        assert result is not None
+        assert "NULL::text AS row_id" in result
+        assert "NULL::text AS NULL::text" not in result
+
+
+# ===========================================================================
+# 9c. _fix_primary_reserved_alias, _fix_select_distinct_as, _fix_null_text_as_null_text
+# ===========================================================================
+class TestFixPrimaryAndSelectDistinctAs:
+    def test_primary_alias_quoted(self):
+        body = "SELECT PRIMARY.check_id FROM apps.ap_checks AS PRIMARY"
+        result = mod._fix_primary_reserved_alias(body)
+        assert 'AS "PRIMARY"' in result
+        assert '"PRIMARY".check_id' in result
+
+    def test_select_distinct_as_fixed(self):
+        body = "SELECT DISTINCT AS parameter_id, x FROM t"
+        result = mod._fix_select_distinct_as(body)
+        assert "SELECT DISTINCT NULL AS parameter_id" in result
+
+    def test_null_text_as_null_text_fixed(self):
+        body = "SELECT NULL::text AS NULL::text, a FROM t"
+        result = mod._fix_null_text_as_null_text(body)
+        assert 'NULL::text AS row_id' in result
+        assert 'AS NULL::text' not in result
+
 
 # ===========================================================================
 # 10. USERENV (_replace_userenv_to_postgres)
