@@ -4418,9 +4418,12 @@ def execute_view_with_column_retry(
     * ``missing FROM-clause entry for table X`` -- dangling alias references
       (common with Oracle package references that survived conversion).
 
+    Always handled (in addition to missing FROM-clause entry):
+    * ``function X does not exist`` -- replace with NULL and retry.
+
     Controlled by two independent flags:
-    * **auto_remove_columns** -- handle ``column X does not exist``,
-      ``function X does not exist``, and ``ctid`` errors.
+    * **auto_remove_columns** -- handle ``column X does not exist``
+      and ``ctid`` errors.
     * **auto_remove_relations** -- handle ``relation X does not exist``
       (table/view not present in PostgreSQL).
 
@@ -4506,29 +4509,29 @@ def execute_view_with_column_retry(
                 current_sql = new_sql
                 continue
 
-            # Try missing-function error: replace with NULL and add alias if needed
-            func_name = _parse_missing_function(err)
-            log.debug("[RETRY] %s: _parse_missing_function -> %s", display, func_name)
-            if func_name:
-                err_key = f"func|{func_name}"
-                if err_key in seen_errors:
-                    log.warning("[FUNC-REPLACE] %s: function %s still missing after replace -- giving up", display, func_name)
-                    return False, err, current_sql, removed_columns
-                seen_errors.add(err_key)
-                log.info("[FUNC-REPLACE] %s: replacing function %s with NULL (attempt %d)", display, func_name, attempt + 1)
-                log.debug("[FUNC-REPLACE] %s: BEFORE _replace_function_with_null_and_alias -- SQL length=%d", display, len(current_sql))
-                new_sql = _replace_function_with_null_and_alias(current_sql, func_name)
-                log.debug("[FUNC-REPLACE] %s: AFTER _replace_function_with_null_and_alias -- result=%s",
-                          display,
-                          'None' if new_sql is None else ('no_change' if new_sql and new_sql.strip() == current_sql.strip() else 'changed'))
-                if new_sql is None or (new_sql.strip() == current_sql.strip()):
-                    log.warning("[FUNC-REPLACE] %s: could not replace %s in SQL -- giving up", display, func_name)
-                    return False, err, current_sql, removed_columns
-                removed_columns.append(f"func:{func_name}")
-                log.info("[FUNC-REPLACE] %s: DONE replacing %s with NULL -- new SQL length=%d (was %d)",
-                         display, func_name, len(new_sql), len(current_sql))
-                current_sql = new_sql
-                continue
+        # --- Always handle missing-function error: replace with NULL and add alias if needed ---
+        func_name = _parse_missing_function(err)
+        log.debug("[RETRY] %s: _parse_missing_function -> %s", display, func_name)
+        if func_name:
+            err_key = f"func|{func_name}"
+            if err_key in seen_errors:
+                log.warning("[FUNC-REPLACE] %s: function %s still missing after replace -- giving up", display, func_name)
+                return False, err, current_sql, removed_columns
+            seen_errors.add(err_key)
+            log.info("[FUNC-REPLACE] %s: replacing function %s with NULL (attempt %d)", display, func_name, attempt + 1)
+            log.debug("[FUNC-REPLACE] %s: BEFORE _replace_function_with_null_and_alias -- SQL length=%d", display, len(current_sql))
+            new_sql = _replace_function_with_null_and_alias(current_sql, func_name)
+            log.debug("[FUNC-REPLACE] %s: AFTER _replace_function_with_null_and_alias -- result=%s",
+                      display,
+                      'None' if new_sql is None else ('no_change' if new_sql and new_sql.strip() == current_sql.strip() else 'changed'))
+            if new_sql is None or (new_sql.strip() == current_sql.strip()):
+                log.warning("[FUNC-REPLACE] %s: could not replace %s in SQL -- giving up", display, func_name)
+                return False, err, current_sql, removed_columns
+            removed_columns.append(f"func:{func_name}")
+            log.info("[FUNC-REPLACE] %s: DONE replacing %s with NULL -- new SQL length=%d (was %d)",
+                     display, func_name, len(new_sql), len(current_sql))
+            current_sql = new_sql
+            continue
 
         # --- Always handle missing FROM-clause entry (Oracle package aliases) ---
         from_alias = _parse_missing_from_entry(err)
@@ -5842,27 +5845,22 @@ class RecursiveViewMigrator:
         seen_relations: set[str] = set()
 
         for attempt in range(1, self.MAX_RETRIES_PER_VIEW + 1):
-            # First try with auto-remove-columns if enabled (handles column/function errors)
-            if self.auto_remove_columns:
-                ok, err, final_sql, removed = execute_view_with_column_retry(
-                    self.pg_conn,
-                    pg_sql,
-                    schema,
-                    view_name,
-                    auto_remove_columns=True,
-                    auto_remove_relations=False,  # we handle relations ourselves
-                )
-                if ok:
-                    if removed:
-                        log.info("[%s] OK (auto-removed: %s)", display, ", ".join(removed))
-                    self._record_result(schema, view_name, True, "ok", removed_items=removed, final_sql=final_sql)
-                    return True
-                pg_sql = final_sql  # use the cleaned-up SQL for further retries
-            else:
-                ok, err = self._execute_on_pg(pg_sql, schema, view_name)
-                if ok:
-                    self._record_result(schema, view_name, True, "ok", final_sql=pg_sql)
-                    return True
+            # Execute with retry: always handles function errors (replace with NULL);
+            # column/relation removal gated by auto_remove_columns / we handle relations ourselves
+            ok, err, final_sql, removed = execute_view_with_column_retry(
+                self.pg_conn,
+                pg_sql,
+                schema,
+                view_name,
+                auto_remove_columns=self.auto_remove_columns,
+                auto_remove_relations=False,  # we handle relations ourselves
+            )
+            if ok:
+                if removed:
+                    log.info("[%s] OK (auto-removed: %s)", display, ", ".join(removed))
+                self._record_result(schema, view_name, True, "ok", removed_items=removed, final_sql=final_sql)
+                return True
+            pg_sql = final_sql  # use the cleaned-up SQL for further retries (e.g. after function replace)
 
             # Check for "schema X does not exist" -- create the schema and retry
             schema_miss = re.search(r'schema\s+"?([a-zA-Z_][a-zA-Z0-9_]*)"?\s+does\s+not\s+exist', err or "", re.IGNORECASE)
@@ -6176,7 +6174,7 @@ def main() -> None:
         "--auto-remove-columns",
         action="store_true",
         default=False,
-        help="Auto-remove missing columns/functions on PG execution errors (ignored with --no-execute)",
+        help="Auto-remove missing columns on PG execution errors (function errors always handled; ignored with --no-execute)",
     )
     parser.add_argument(
         "--synonym-csv",
