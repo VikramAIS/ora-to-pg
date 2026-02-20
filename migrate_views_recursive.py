@@ -183,11 +183,26 @@ def _fetch_view_ddl_from_oracle(
     owner: str,
     view_name: str,
 ) -> Optional[str]:
-    """Fetch CREATE VIEW DDL from Oracle using ALL_VIEWS for the given owner.view_name.
-    ALL_VIEWS.TEXT contains only the SELECT body; we wrap it in CREATE OR REPLACE VIEW ... AS.
+    """Fetch CREATE VIEW DDL from Oracle.
+    Tries DBMS_METADATA.GET_DDL first (full DDL including column list).
+    Falls back to ALL_VIEWS.TEXT (SELECT body only, no column list).
     """
     cursor = connection.cursor()
     try:
+        # Try DBMS_METADATA first to get full DDL with column list
+        try:
+            cursor.execute(
+                "SELECT DBMS_METADATA.GET_DDL('VIEW', :v, :o) FROM DUAL",
+                {"v": view_name.upper(), "o": owner.upper()},
+            )
+            row = cursor.fetchone()
+            if row and row[0]:
+                ddl = row[0] if isinstance(row[0], str) else row[0].read()
+                if ddl and ("CREATE " in ddl.upper() or "VIEW " in ddl.upper()):
+                    return ddl.strip().rstrip("/").strip()
+        except Exception:
+            pass
+        # Fallback: ALL_VIEWS.TEXT (SELECT body only; no column list)
         cursor.execute(
             "SELECT TEXT FROM ALL_VIEWS WHERE OWNER = :o AND VIEW_NAME = :v",
             {"o": owner.upper(), "v": view_name.upper()},
@@ -2856,13 +2871,97 @@ def get_oracle_schema_objects(connection, owner: str) -> dict[str, str]:
         cursor.close()
 
 
+def _find_from_clause_spans(body: str) -> list[tuple[int, int]]:
+    """Return list of (start, end) spans for each FROM clause in body (for scoping comma-separated table refs)."""
+    spans: list[tuple[int, int]] = []
+    depth = 0
+    in_single = False
+    i = 0
+    n = len(body)
+    from_end_keywords = re.compile(
+        r"\b(WHERE|GROUP|ORDER|HAVING|LIMIT|OFFSET|UNION|INTERSECT|EXCEPT)\b",
+        re.IGNORECASE,
+    )
+    while i < n:
+        c = body[i]
+        if in_single:
+            if c == "'" and (i + 1 >= n or body[i + 1] != "'"):
+                in_single = False
+            elif c == "'" and i + 1 < n and body[i + 1] == "'":
+                i += 1
+            i += 1
+            continue
+        if c == "'":
+            in_single = True
+            i += 1
+            continue
+        if c == "(":
+            depth += 1
+            i += 1
+            continue
+        if c == ")":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0:
+            prev = i > 0 and (body[i - 1].isalnum() or body[i - 1] == "_")
+            if not prev and re.match(r"FROM\b", body[i:], re.IGNORECASE):
+                start = i
+                i += 4  # skip "FROM"
+                while i < n and body[i] in " \t\n":
+                    i += 1
+                scan_depth = depth
+                scan_single = in_single
+                scan = i
+                while scan < n:
+                    cc = body[scan]
+                    if scan_single:
+                        if cc == "'" and (scan + 1 >= n or body[scan + 1] != "'"):
+                            scan_single = False
+                        elif cc == "'" and scan + 1 < n and body[scan + 1] == "'":
+                            scan += 1
+                        scan += 1
+                        continue
+                    if cc == "'":
+                        scan_single = True
+                        scan += 1
+                        continue
+                    if cc == "(":
+                        scan_depth += 1
+                        scan += 1
+                        continue
+                    if cc == ")":
+                        scan_depth -= 1
+                        scan += 1
+                        continue
+                    if scan_depth == 0:
+                        kw = from_end_keywords.match(body[scan:])
+                        if kw:
+                            spans.append((start, scan))
+                            i = scan
+                            break
+                    scan += 1
+                else:
+                    spans.append((start, n))
+                    break
+        i += 1
+    return spans
+
+
 def _get_unqualified_table_refs(body: str) -> set[str]:
-    """Return set of unqualified identifiers used as table/view in FROM and JOIN (no dot in name)."""
+    """Return set of unqualified identifiers used as table/view in FROM and JOIN (no dot in name).
+    Includes comma-separated tables: FROM t1, t2, t3."""
     refs: set[str] = set()
     for m in _UNQUALIFIED_TABLE_REFS_PATTERN.finditer(body):
         name = m.group(1).strip()
         if "." not in name:
             refs.add(name)
+    for start, end in _find_from_clause_spans(body):
+        from_part = body[start:end]
+        for m in _UNQUALIFIED_TABLE_REFS_COMMA_PATTERN.finditer(from_part):
+            name = m.group(1).strip()
+            if "." not in name:
+                refs.add(name)
     return refs
 
 
@@ -2871,24 +2970,33 @@ def _qualify_unqualified_refs_in_body(
     view_schema: str,
     connection,
     schema_objects_cache: Optional[dict[str, dict[str, str]]] = None,
+    synonym_map: Optional[dict[str, str]] = None,
 ) -> str:
     """
     Qualify unqualified table/view refs in body using Oracle object type and APPS/APPS2 rules.
-    - If unqualified ref is a VIEW in Oracle (in view_schema): use view_schema.ref
-    - If unqualified ref is a TABLE and view_schema is APPS: use prefix.ref where prefix = chars before first _
-    - If unqualified ref is a TABLE and view_schema is APPS2: use prefix2.ref (prefix + '2')
-    - Otherwise leave unqualified (or use view_schema if we can't determine).
-    When schema_objects_cache is provided (schema_upper -> object_name_upper -> type), uses it instead of per-ref Oracle queries.
+    Skip qualification for refs that exist as PUBLIC synonyms (or as view/synonym in source);
+    those stay unqualified so dependency resolution can convert and execute them first.
+    - If ref is in synonym_map (PUBLIC synonym): leave unqualified (dependency resolution handles it)
+    - Else if unqualified ref is a VIEW in Oracle (in view_schema): use view_schema.ref
+    - Else if unqualified ref is a TABLE and view_schema is APPS: use prefix.ref where prefix = chars before first _
+    - Else if unqualified ref is a TABLE and view_schema is APPS2: use prefix2.ref (prefix + '2')
+    - Otherwise leave unqualified.
+    When schema_objects_cache is provided, uses it instead of per-ref Oracle queries.
     """
     view_schema_upper = (view_schema or "").strip().upper()
     unqualified = _get_unqualified_table_refs(body)
     if not unqualified:
         return body
 
+    synonym_map = synonym_map or {}
     schema_objs = (schema_objects_cache or {}).get(view_schema_upper)
     replacement_map: dict[str, str] = {}
     for ref in unqualified:
         ref_upper = (ref or "").upper()
+        # Skip qualification if ref exists as PUBLIC synonym (or PUBLIC.synonym_name)
+        # Dependency resolution will convert and execute that first
+        if synonym_map.get(ref_upper) or synonym_map.get(f"PUBLIC.{ref_upper}"):
+            continue
         if schema_objs is not None:
             obj_type = schema_objs.get(ref_upper)
         else:
@@ -2914,14 +3022,27 @@ def _qualify_unqualified_refs_in_body(
     # Replace only in FROM/JOIN position: (FROM|JOIN) + whitespace + identifier (case-insensitive match for ref)
     ref_lower_to_qual: dict[str, str] = {k.lower(): v for k, v in replacement_map.items()}
 
-    def replacer(m: re.Match) -> str:
+    def from_join_replacer(m: re.Match) -> str:
         ref = m.group(2)
         qual = ref_lower_to_qual.get(ref.lower()) or replacement_map.get(ref)
         if qual is not None:
             return m.group(1) + " " + qual
         return m.group(0)
 
-    body = _QUALIFY_FROM_JOIN_PATTERN.sub(replacer, body)
+    def comma_replacer(m: re.Match) -> str:
+        ref = m.group(2)
+        qual = ref_lower_to_qual.get(ref.lower()) or replacement_map.get(ref)
+        if qual is not None:
+            return m.group(1) + qual
+        return m.group(0)
+
+    body = _QUALIFY_FROM_JOIN_PATTERN.sub(from_join_replacer, body)
+    spans = _find_from_clause_spans(body)
+    for start, end in reversed(spans):
+        from_part = body[start:end]
+        new_from = _QUALIFY_COMMA_TABLE_PATTERN.sub(comma_replacer, from_part)
+        if new_from != from_part:
+            body = body[:start] + new_from + body[end:]
     return body
 
 
@@ -2930,9 +3051,11 @@ def apply_qualify_unqualified_refs(
     view_schema: str,
     connection,
     schema_objects_cache: Optional[dict[str, dict[str, str]]] = None,
+    synonym_map: Optional[dict[str, str]] = None,
 ) -> str:
     """
     Final step: qualify unqualified tables/views in the view body using Oracle object type and APPS/APPS2 rules.
+    Skips qualification for refs that exist as PUBLIC synonyms (dependency resolution handles them first).
     Returns updated pg_sql (CREATE OR REPLACE VIEW ... AS body).
     Preserves explicit column list (col1, col2) when present.
     When schema_objects_cache is provided, qualification uses it (no per-ref Oracle queries).
@@ -2942,8 +3065,10 @@ def apply_qualify_unqualified_refs(
         return pg_sql
     view_name_in_ddl = create_match.group(1).strip()
     column_list_raw = create_match.group(2)
-    body = create_match.group(3)
-    body = _qualify_unqualified_refs_in_body(body, view_schema, connection, schema_objects_cache)
+    body = create_match.group(3).rstrip().rstrip(";").rstrip()
+    body = _qualify_unqualified_refs_in_body(
+        body, view_schema, connection, schema_objects_cache, synonym_map,
+    )
     column_list_suffix = f" {column_list_raw}" if column_list_raw else " "
     return f"CREATE OR REPLACE VIEW {view_name_in_ddl}{column_list_suffix}AS\n{body}\n;"
 
@@ -4563,6 +4688,14 @@ _UNQUALIFIED_TABLE_REFS_PATTERN = re.compile(
     r"([a-zA-Z_][a-zA-Z0-9_]*)",
     re.IGNORECASE,
 )
+_UNQUALIFIED_TABLE_REFS_COMMA_PATTERN = re.compile(
+    r",\s+([a-zA-Z_][a-zA-Z0-9_]*)\b",
+    re.IGNORECASE,
+)
+_QUALIFY_COMMA_TABLE_PATTERN = re.compile(
+    r"(,\s+)([a-zA-Z_][a-zA-Z0-9_]*)\b",
+    re.IGNORECASE,
+)
 _QUALIFY_FROM_JOIN_PATTERN = re.compile(
     r"(\b(?:FROM|(?:NATURAL\s+)?(?:LEFT|RIGHT|INNER|OUTER|CROSS|FULL)\s+(?:OUTER\s+)?JOIN)\s+)([a-zA-Z_][a-zA-Z0-9_]*)\b",
     re.IGNORECASE,
@@ -4901,12 +5034,15 @@ def _convert_single_view(
     else:
         pg_sql = res
 
-    # Step 3: qualify unqualified refs
+    # Step 3: qualify unqualified refs (skip refs in PUBLIC; dep resolution handles them first)
     if do_qualify:
         try:
             if qualify_lock:
                 with qualify_lock:
-                    ok, res = _run_with_step_timeout(step_sec, apply_qualify_unqualified_refs, pg_sql, schema, conn_o, schema_objects_cache)
+                    ok, res = _run_with_step_timeout(
+                        step_sec, apply_qualify_unqualified_refs,
+                        pg_sql, schema, conn_o, schema_objects_cache, synonym_map,
+                    )
                     if ok:
                         pg_sql = res
                     else:
@@ -4914,7 +5050,10 @@ def _convert_single_view(
                         log.warning("[VIEW %s] qualify TIMEOUT after %ds, skipping qualify", display, step_sec or 15)
                         warning_lines.append(f"-- WARNING: qualify timeout after {step_sec or 15}s, step skipped\n")
             else:
-                ok, res = _run_with_step_timeout(step_sec, apply_qualify_unqualified_refs, pg_sql, schema, conn_o, schema_objects_cache)
+                ok, res = _run_with_step_timeout(
+                    step_sec, apply_qualify_unqualified_refs,
+                    pg_sql, schema, conn_o, schema_objects_cache, synonym_map,
+                )
                 if ok:
                     pg_sql = res
                 else:
@@ -5580,11 +5719,12 @@ class RecursiveViewMigrator:
                         log.warning("Failed to create synonym target view %s.%s; cannot create synonym-view", rs_lower, rn_lower)
                         return False
 
-            # Determine PG schema/name for the synonym-view
+            # Determine PG schema/name for the synonym-view.
+            # Unqualified relations (public synonyms) go in "public" so search_path finds them.
             if "." in relation:
                 syn_schema, syn_name = relation.split(".", 1)
             else:
-                syn_schema = parent_schema if parent_schema else "public"
+                syn_schema = "public"
                 syn_name = relation
 
             ok, err = self._create_synonym_view(syn_schema, syn_name, rs_lower, rn_lower)

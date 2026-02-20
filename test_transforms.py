@@ -2430,5 +2430,59 @@ class TestReplaceFunctionWithNullAndAlias:
         assert "NULL" in result
 
 
+# ===========================================================================
+# View column list preservation
+# ===========================================================================
+class TestViewColumnListPreservation:
+    """Tests that explicit (col1, col2) column lists are preserved through the pipeline."""
+
+    def test_normalize_preserves_column_list(self):
+        ddl = "CREATE VIEW abc.test (col1, col2) AS SELECT a, b FROM t"
+        r = mrv.normalize_view_script(ddl)
+        assert "(col1, col2)" in r
+
+    def test_normalize_restores_from_orig_column_list(self):
+        pg_no_cols = "CREATE OR REPLACE VIEW apps.v AS SELECT x FROM t"
+        orig_col = "(COL1, COL2)"
+        r = mrv.normalize_view_script(pg_no_cols, orig_schema="apps", orig_view_name="v", orig_column_list=orig_col)
+        assert "(col1, col2)" in r
+
+    def test_qualify_preserves_column_list(self):
+        pg = "CREATE OR REPLACE VIEW apps.test (col1, col2) AS SELECT a.x FROM t a"
+        cache = {"APPS": {}}
+        r = mrv.apply_qualify_unqualified_refs(pg, "apps", None, cache)
+        assert "(col1, col2)" in r
+
+    def test_qualify_comma_separated_tables(self):
+        """FROM table1 t1, table2 t2, table3 t3 - all tables get qualified."""
+        pg = "CREATE OR REPLACE VIEW apps.v AS SELECT t1.a FROM table1 t1, table2 t2, table3 t3"
+        cache = {"APPS": {"TABLE1": "TABLE", "TABLE2": "TABLE", "TABLE3": "TABLE"}}
+        r = mrv.apply_qualify_unqualified_refs(pg, "apps", None, cache)
+        # All three comma-separated tables must be qualified (APPS: prefix from chars before first _)
+        assert "table1.table1" in r or ".table1" in r
+        assert "table2.table2" in r or ".table2" in r
+        assert "table3.table3" in r or ".table3" in r
+        # Aliases preserved
+        assert " t1," in r or " t1 " in r
+        assert " t2," in r or " t2 " in r
+        assert " t3" in r
+
+    def test_qualify_does_not_touch_select_list_columns(self):
+        """SELECT a, table1 FROM t - table1 in SELECT is column ref, must not be qualified."""
+        pg = "CREATE OR REPLACE VIEW apps.v AS SELECT a, table1 FROM my_table"
+        cache = {"APPS": {"MY_TABLE": "TABLE", "TABLE1": "TABLE"}}
+        r = mrv.apply_qualify_unqualified_refs(pg, "apps", None, cache)
+        # my_table (after FROM) gets qualified; table1 in SELECT stays as column name
+        assert "SELECT a, table1 FROM" in r or "SELECT a, table1 " in r
+        assert "table1" in r  # column name preserved (no schema.table1 in SELECT)
+
+    def test_extract_orig_column_list(self):
+        ddl = "CREATE VIEW x (a, b, c) AS SELECT 1 FROM dual"
+        m = mrv._EXTRACT_ORIG_COLUMN_LIST_PATTERN.search(mrv._first_statement_only(ddl))
+        assert m is not None
+        assert "a" in m.group(1)
+        assert "b" in m.group(1)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
