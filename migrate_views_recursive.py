@@ -4471,10 +4471,10 @@ def execute_view_with_column_retry(
 
     Always handled (in addition to missing FROM-clause entry):
     * ``function X does not exist`` -- replace with NULL and retry.
+    * ``column X.ctid does not exist`` -- replace with NULL::text and retry.
 
     Controlled by two independent flags:
-    * **auto_remove_columns** -- handle ``column X does not exist``
-      and ``ctid`` errors.
+    * **auto_remove_columns** -- handle ``column X does not exist`` (ctid handled always).
     * **auto_remove_relations** -- handle ``relation X does not exist``
       (table/view not present in PostgreSQL).
 
@@ -4523,42 +4523,25 @@ def execute_view_with_column_retry(
                     return False, err, current_sql, removed_columns
                 seen_errors.add(err_key)
 
-                # Special case: ctid
-                if col.lower() == "ctid":
-                    log.info("[COL-REPLACE] %s: replacing %s with NULL::text (attempt %d)", display, col_display, attempt + 1)
-                    log.debug("[COL-REPLACE] %s: BEFORE _replace_ctid_with_null -- SQL length=%d", display, len(current_sql))
-                    new_sql = _replace_ctid_with_null(current_sql, qualifier)
-                    log.debug("[COL-REPLACE] %s: AFTER _replace_ctid_with_null -- result=%s",
-                              display, 'changed' if (new_sql and new_sql.strip() != current_sql.strip()) else 'no_change')
+                # ctid is handled in the "always" block below (like function); skip here
+                if col.lower() != "ctid":
+                    log.info("[COL-REMOVE] %s: removing column %s (attempt %d)", display, col_display, attempt + 1)
+                    log.debug("[COL-REMOVE] %s: BEFORE _remove_column_references(qualifier=%r, col=%r) -- SQL length=%d",
+                              display, qualifier, col, len(current_sql))
+                    new_sql = _remove_column_references(current_sql, qualifier, col)
+                    log.debug("[COL-REMOVE] %s: AFTER _remove_column_references -- result=%s, new_length=%s",
+                              display,
+                              'None' if new_sql is None else ('no_change' if new_sql.strip() == current_sql.strip() else 'changed'),
+                              len(new_sql) if new_sql else 'N/A')
                     if new_sql is None or new_sql.strip() == current_sql.strip():
-                        log.debug("[COL-REPLACE] %s: ctid replace failed, falling back to _remove_column_references", display)
-                        new_sql = _remove_column_references(current_sql, qualifier, col)
-                    if new_sql is None or new_sql.strip() == current_sql.strip():
-                        log.warning("[COL-REPLACE] %s: could not fix %s -- giving up", display, col_display)
+                        log.warning("[COL-REMOVE] %s: could not remove %s from SQL -- giving up", display, col_display)
+                        log.debug("[COL-REMOVE] %s: SQL at give-up: %s", display, _sql_preview(current_sql, 500))
                         return False, err, current_sql, removed_columns
-                    removed_columns.append(f"{col_display}->NULL")
-                    log.info("[COL-REPLACE] %s: DONE replacing %s -- new SQL length=%d (was %d)",
-                             display, col_display, len(new_sql), len(current_sql))
+                    removed_columns.append(col_display)
+                    log.info("[COL-REMOVE] %s: DONE removing %s -- new SQL length=%d (was %d, delta=%d)",
+                             display, col_display, len(new_sql), len(current_sql), len(current_sql) - len(new_sql))
                     current_sql = new_sql
                     continue
-
-                log.info("[COL-REMOVE] %s: removing column %s (attempt %d)", display, col_display, attempt + 1)
-                log.debug("[COL-REMOVE] %s: BEFORE _remove_column_references(qualifier=%r, col=%r) -- SQL length=%d",
-                          display, qualifier, col, len(current_sql))
-                new_sql = _remove_column_references(current_sql, qualifier, col)
-                log.debug("[COL-REMOVE] %s: AFTER _remove_column_references -- result=%s, new_length=%s",
-                          display,
-                          'None' if new_sql is None else ('no_change' if new_sql.strip() == current_sql.strip() else 'changed'),
-                          len(new_sql) if new_sql else 'N/A')
-                if new_sql is None or new_sql.strip() == current_sql.strip():
-                    log.warning("[COL-REMOVE] %s: could not remove %s from SQL -- giving up", display, col_display)
-                    log.debug("[COL-REMOVE] %s: SQL at give-up: %s", display, _sql_preview(current_sql, 500))
-                    return False, err, current_sql, removed_columns
-                removed_columns.append(col_display)
-                log.info("[COL-REMOVE] %s: DONE removing %s -- new SQL length=%d (was %d, delta=%d)",
-                         display, col_display, len(new_sql), len(current_sql), len(current_sql) - len(new_sql))
-                current_sql = new_sql
-                continue
 
         # --- Always handle missing-function error: replace with NULL and add alias if needed ---
         func_name = _parse_missing_function(err)
@@ -4583,6 +4566,37 @@ def execute_view_with_column_retry(
                      display, func_name, len(new_sql), len(current_sql))
             current_sql = new_sql
             continue
+
+        # --- Always handle ctid column does not exist: replace with NULL::text (like function) ---
+        # Handles both "column b.ctid does not exist" (qualified) and "column ctid does not exist" (bare)
+        parsed = _parse_missing_column(err)
+        is_ctid_err = False
+        qualifier = ""
+        if parsed:
+            q, c = parsed
+            if c and c.lower() == "ctid":
+                is_ctid_err = True
+                qualifier = q
+        if not is_ctid_err and err and "ctid" in err.lower() and "column" in err.lower() and "does not exist" in err.lower():
+            is_ctid_err = True
+        if is_ctid_err:
+            col_display = f"{qualifier}.ctid" if qualifier else "ctid"
+            err_key = f"ctid|{qualifier}|ctid"
+            if err_key in seen_errors:
+                log.warning("[CTID-REPLACE] %s: ctid still missing after replace -- giving up", display)
+                return False, err, current_sql, removed_columns
+            seen_errors.add(err_key)
+            log.info("[CTID-REPLACE] %s: replacing %s with NULL::text (attempt %d)", display, col_display, attempt + 1)
+            new_sql = _replace_ctid_with_null(current_sql, qualifier)
+            if qualifier:
+                new_sql = _replace_ctid_with_null(new_sql or current_sql, "")  # also replace any bare ctid
+            if new_sql is None or new_sql.strip() == current_sql.strip():
+                log.debug("[CTID-REPLACE] %s: ctid replace failed, falling back to _remove_column_references", display)
+                new_sql = _remove_column_references(current_sql, qualifier, "ctid")
+            if new_sql and new_sql.strip() != current_sql.strip():
+                removed_columns.append(f"{col_display}->NULL")
+                current_sql = new_sql
+                continue
 
         # --- Always handle missing FROM-clause entry (Oracle package aliases) ---
         from_alias = _parse_missing_from_entry(err)
