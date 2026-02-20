@@ -2378,5 +2378,57 @@ class TestCommentAliasInPipeline:
         assert "AS CUSTOMER AS" not in upper
 
 
+# ===========================================================================
+# _replace_function_with_null_and_alias (function does not exist handling)
+# ===========================================================================
+class TestReplaceFunctionWithNullAndAlias:
+    """Tests for replacing missing function calls with NULL + alias."""
+
+    def test_simple_function_replaced_with_null_and_alias(self):
+        sql = "CREATE OR REPLACE VIEW v AS SELECT apps.missing_func(1) FROM t"
+        result = mrv._replace_function_with_null_and_alias(sql, "apps.missing_func")
+        assert result is not None
+        assert "missing_func(1)" not in result
+        assert "apps.missing_func(" not in result
+        assert "NULL" in result
+        assert "AS " in result
+        assert "FROM t" in result
+
+    def test_function_with_existing_alias_keeps_alias(self):
+        sql = "CREATE OR REPLACE VIEW v AS SELECT apps.missing_func(1) AS my_col FROM t"
+        result = mrv._replace_function_with_null_and_alias(sql, "apps.missing_func")
+        assert result is not None
+        assert "AS my_col" in result
+        assert "NULL" in result
+
+    def test_bare_function_name(self):
+        sql = "CREATE OR REPLACE VIEW v AS SELECT my_func() FROM t"
+        result = mrv._replace_function_with_null_and_alias(sql, "my_func")
+        assert result is not None
+        assert "my_func()" not in result
+        assert "NULL AS my_func" in result
+
+    def test_multiple_select_items_one_with_func(self):
+        sql = "CREATE OR REPLACE VIEW v AS SELECT a.col1, apps.func(x), b.col2 FROM t"
+        result = mrv._replace_function_with_null_and_alias(sql, "apps.func")
+        assert result is not None
+        assert "a.col1" in result
+        assert "b.col2" in result
+        assert "func(" not in result
+        assert "NULL" in result
+
+    def test_no_function_no_change(self):
+        sql = "CREATE OR REPLACE VIEW v AS SELECT a.col1 FROM t"
+        result = mrv._replace_function_with_null_and_alias(sql, "nonexistent_func")
+        assert result is None
+
+    def test_reserved_word_alias_quoted(self):
+        sql = "CREATE OR REPLACE VIEW v AS SELECT apps.column(1) FROM t"
+        result = mrv._replace_function_with_null_and_alias(sql, "apps.column")
+        assert result is not None
+        assert '"column"' in result
+        assert "NULL" in result
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -2675,7 +2675,8 @@ def normalize_view_script(
     if not create_match:
         return pg_ddl
     raw_name = create_match.group(1).strip()
-    body = create_match.group(2)
+    column_list_raw = create_match.group(2)
+    body = create_match.group(3)
     # Force original schema.view_name when provided; otherwise extract from DDL
     if (orig_schema or "").strip() and (orig_view_name or "").strip():
         view_name = f"{orig_schema.strip()}.{orig_view_name.strip()}".lower()
@@ -2743,7 +2744,18 @@ def normalize_view_script(
     body = body.replace("pg_to_char__(", "to_char(")
     body = body.replace("pg_to_date__(", "to_date(")
     body = body.replace("pg_to_timestamp__(", "to_timestamp(")
-    return f"CREATE OR REPLACE VIEW {view_name} AS\n{body}\n;"
+
+    # Preserve explicit column list (col1, col2) when present
+    column_list_suffix = " "
+    if column_list_raw:
+        col_content = column_list_raw.strip().strip("()").strip()
+        if col_content:
+            col_parts = [c.strip() for c in col_content.split(",") if c.strip()]
+            if col_parts:
+                col_normalized = _lowercase_body_identifiers(", ".join(col_parts))
+                column_list_suffix = f" ({col_normalized}) "
+
+    return f"CREATE OR REPLACE VIEW {view_name}{column_list_suffix}AS\n{body}\n;"
 
 
 # Type alias for (schema, view_name) for dependency tracking
@@ -3396,6 +3408,148 @@ def _parse_missing_function(err: str) -> Optional[str]:
     if m2:
         return m2.group(1)
     return None
+
+
+def _replace_function_call_with_null(text: str, func_name: str) -> str:
+    """Replace all occurrences of func_name(...) with NULL in *text*.
+
+    Handles nested parentheses. func_name may be schema.func or bare func.
+    """
+    parts = func_name.rsplit(".", 1)
+    if len(parts) == 2:
+        schema_part, bare_func = parts
+        func_start_pat = (
+            r'(?:' + re.escape(schema_part) + r'\s*\.\s*)?' + re.escape(bare_func) + r'\s*\('
+        )
+    else:
+        bare_func = parts[0]
+        func_start_pat = (
+            r'(?:[a-zA-Z_][a-zA-Z0-9_]*\s*\.\s*)?' + re.escape(bare_func) + r'\s*\('
+        )
+    func_start_re = re.compile(r'\b' + func_start_pat, re.IGNORECASE)
+
+    result = []
+    i = 0
+    while i < len(text):
+        m = func_start_re.search(text, i)
+        if not m:
+            result.append(text[i:])
+            break
+        result.append(text[i:m.start()])
+        result.append("NULL")
+        # Find matching closing paren
+        depth = 1
+        j = m.end()
+        in_single = False
+        while j < len(text) and depth > 0:
+            c = text[j]
+            if in_single:
+                if c == "'" and (j + 1 >= len(text) or text[j + 1] != "'"):
+                    in_single = False
+                elif c == "'" and j + 1 < len(text) and text[j + 1] == "'":
+                    j += 1
+                j += 1
+                continue
+            if c == "'":
+                in_single = True
+                j += 1
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            j += 1
+        i = j
+    return "".join(result)
+
+
+def _select_item_has_explicit_alias(item: str) -> bool:
+    """True if the select item has AS alias or trailing implicit alias."""
+    item = item.strip().rstrip()
+    if re.search(r'\bAS\s+["\w]', item, re.IGNORECASE):
+        return True
+    m = re.search(r'\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*$', item)
+    if m:
+        tail = m.group(1).upper()
+        if tail not in ("END", "NULL", "TRUE", "FALSE", "CASE"):
+            return True
+    return False
+
+
+def _replace_function_with_null_and_alias(sql: str, func_name: str) -> Optional[str]:
+    """Replace all function calls with NULL and add alias if the column has none.
+
+    When a PostgreSQL error reports 'function X does not exist', this replaces
+    each func_name(...) with NULL. For SELECT list items, if the resulting
+    expression has no alias, adds AS <alias> derived from the function name.
+    """
+    if not func_name:
+        return None
+
+    bare_func = func_name.rsplit(".", 1)[-1]
+    alias_base = re.sub(r'[^a-zA-Z0-9_]', '_', bare_func)
+    if not alias_base or alias_base[0].isdigit():
+        alias_base = "col_" + alias_base
+    alias_base = _quote_alias_if_reserved(alias_base)
+
+    create_match = re.match(
+        r"(CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+\S+\s*(?:\([^)]*\)\s*)?AS\s+)(.*)",
+        sql, re.IGNORECASE | re.DOTALL,
+    )
+    if not create_match:
+        return None
+    header = create_match.group(1)
+    body = create_match.group(2)
+
+    bounds = _find_select_list_bounds(body)
+    if not bounds:
+        return None
+    start, end = bounds
+    select_list = body[start:end]
+    parts = _split_top_level_commas(select_list)
+
+    func_check = re.compile(
+        r'(?:[a-zA-Z_][a-zA-Z0-9_]*\s*\.\s*)?' + re.escape(bare_func) + r'\s*\(',
+        re.IGNORECASE,
+    )
+    if "." in func_name:
+        schema_part = func_name.split(".", 1)[0]
+        func_check = re.compile(
+            r'(?:(?:' + re.escape(schema_part) + r'\s*\.\s*)?' + re.escape(bare_func) + r')\s*\(',
+            re.IGNORECASE,
+        )
+
+    new_parts = []
+    alias_counter = [0]
+    changed = False
+
+    for part in parts:
+        stripped = part.strip()
+        if not func_check.search(stripped):
+            new_parts.append(stripped)
+            continue
+        replaced = _replace_function_call_with_null(stripped, func_name)
+        if replaced != stripped:
+            changed = True
+        if not _select_item_has_explicit_alias(replaced):
+            alias_counter[0] += 1
+            alias_suffix = f"_{alias_counter[0]}" if alias_counter[0] > 1 else ""
+            new_parts.append(f"{replaced} AS {alias_base}{alias_suffix}")
+            changed = True
+        else:
+            new_parts.append(replaced)
+
+    if not changed:
+        return None
+
+    new_select = ", ".join(new_parts)
+    body = body[:start] + new_select + body[end:]
+    sql = header + body
+
+    # Replace function calls in WHERE/ON with NULL
+    sql = _replace_function_call_with_null(sql, func_name)
+
+    return sql
 
 
 def _remove_function_references(sql: str, func_name: str) -> Optional[str]:
@@ -4207,26 +4361,26 @@ def execute_view_with_column_retry(
                 current_sql = new_sql
                 continue
 
-            # Try missing-function error
+            # Try missing-function error: replace with NULL and add alias if needed
             func_name = _parse_missing_function(err)
             log.debug("[RETRY] %s: _parse_missing_function -> %s", display, func_name)
             if func_name:
                 err_key = f"func|{func_name}"
                 if err_key in seen_errors:
-                    log.warning("[FUNC-REMOVE] %s: function %s still missing after removal -- giving up", display, func_name)
+                    log.warning("[FUNC-REPLACE] %s: function %s still missing after replace -- giving up", display, func_name)
                     return False, err, current_sql, removed_columns
                 seen_errors.add(err_key)
-                log.info("[FUNC-REMOVE] %s: removing function %s (attempt %d)", display, func_name, attempt + 1)
-                log.debug("[FUNC-REMOVE] %s: BEFORE _remove_function_references -- SQL length=%d", display, len(current_sql))
-                new_sql = _remove_function_references(current_sql, func_name)
-                log.debug("[FUNC-REMOVE] %s: AFTER _remove_function_references -- result=%s",
+                log.info("[FUNC-REPLACE] %s: replacing function %s with NULL (attempt %d)", display, func_name, attempt + 1)
+                log.debug("[FUNC-REPLACE] %s: BEFORE _replace_function_with_null_and_alias -- SQL length=%d", display, len(current_sql))
+                new_sql = _replace_function_with_null_and_alias(current_sql, func_name)
+                log.debug("[FUNC-REPLACE] %s: AFTER _replace_function_with_null_and_alias -- result=%s",
                           display,
-                          'None' if new_sql is None else ('no_change' if new_sql.strip() == current_sql.strip() else 'changed'))
-                if new_sql is None or new_sql.strip() == current_sql.strip():
-                    log.warning("[FUNC-REMOVE] %s: could not remove %s from SQL -- giving up", display, func_name)
+                          'None' if new_sql is None else ('no_change' if new_sql and new_sql.strip() == current_sql.strip() else 'changed'))
+                if new_sql is None or (new_sql.strip() == current_sql.strip()):
+                    log.warning("[FUNC-REPLACE] %s: could not replace %s in SQL -- giving up", display, func_name)
                     return False, err, current_sql, removed_columns
                 removed_columns.append(f"func:{func_name}")
-                log.info("[FUNC-REMOVE] %s: DONE removing %s -- new SQL length=%d (was %d)",
+                log.info("[FUNC-REPLACE] %s: DONE replacing %s with NULL -- new SQL length=%d (was %d)",
                          display, func_name, len(new_sql), len(current_sql))
                 current_sql = new_sql
                 continue
@@ -4403,7 +4557,7 @@ _NORMALIZE_DROP_VIEW_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _NORMALIZE_CREATE_VIEW_PATTERN = re.compile(
-    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:FORCE\s+)?VIEW\s+(.+?)\s+(?:\([^)]*\)\s+)?AS\s+(.*)",
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:FORCE\s+)?VIEW\s+(.+?)\s+(\([^)]*\)\s+)?AS\s+(.*)",
     re.IGNORECASE | re.DOTALL,
 )
 # Pattern to replace only the view name in CREATE VIEW ... name ... AS (used to force original schema.viewname)
@@ -5545,29 +5699,18 @@ class RecursiveViewMigrator:
                     continue
                 # Already tried this schema, fall through to give up
 
-            # Check for "function X does not exist" -- fetch from Oracle and create
+            # Check for "function X does not exist" -- do NOT fetch from Oracle; record and fail
             missing_func = _parse_missing_function(err)
             if missing_func:
-                func_key = f"func|{missing_func}"
-                if func_key not in seen_relations:
-                    seen_relations.add(func_key)
-                    log.info("[%s] Attempt %d: function '%s' does not exist; fetching from Oracle...", display, attempt, missing_func)
-                    if self._resolve_and_create_function(missing_func, schema):
-                        log.info("[%s] Function '%s' created; retrying view...", display, missing_func)
-                        continue
-                    log.warning("[%s] Could not create function '%s'", display, missing_func)
-                # Already tried or failed -- fall through to other checks
+                self._record_result(
+                    schema, view_name, False, "missing_function",
+                    [f"Function does not exist (not fetched from source): {missing_func}", err[:500]], final_sql=pg_sql,
+                )
+                return False
 
             # Check for "relation does not exist"
             missing_rel = _parse_missing_relation(err)
             if not missing_rel:
-                # If we had a function error that we couldn't resolve, report it
-                if missing_func:
-                    self._record_result(
-                        schema, view_name, False, "missing_function",
-                        [f"Cannot create function: {missing_func}", err[:500]], final_sql=pg_sql,
-                    )
-                    return False
                 log.warning("[%s] Failed with non-relation error: %s", display, err[:200])
                 self._record_result(schema, view_name, False, "execute_error", [err[:500]], final_sql=pg_sql)
                 return False
