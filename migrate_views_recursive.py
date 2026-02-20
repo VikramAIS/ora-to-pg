@@ -2448,6 +2448,8 @@ def _replace_userenv_to_postgres(body: str) -> str:
         # Oracle: USERENV('USER') / USERENV('SESSION_USER') = session username; CLIENT_INFO, TERMINAL, etc. = other
         if arg in ("USER", "SESSIONUSER", "SESSION_USER"):
             repl = "current_user"
+        elif arg in ("LANG", "LANGUAGE"):
+            repl = "USA"
         else:
             repl = "NULL::text"
         body = body[: match.start()] + repl + body[close + 1 :]
