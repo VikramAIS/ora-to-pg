@@ -2429,6 +2429,33 @@ class TestReplaceFunctionWithNullAndAlias:
         assert '"column"' in result
         assert "NULL" in result
 
+    def test_function_inside_aggregate(self):
+        """min(abm_utility.abm_get_origin_code_name(col)) -> min(NULL) AS ..."""
+        sql = "CREATE OR REPLACE VIEW v AS SELECT min(abm_utility.abm_get_origin_code_name(col)) FROM t"
+        result = mrv._replace_function_with_null_and_alias(sql, "abm_utility.abm_get_origin_code_name")
+        assert result is not None
+        assert "abm_utility.abm_get_origin_code_name(" not in result
+        assert "min(NULL)" in result
+        assert "AS " in result
+
+    def test_union_with_function_in_second_branch(self):
+        """Function in UNION second branch is also replaced."""
+        sql = "CREATE OR REPLACE VIEW v AS SELECT a FROM t1 UNION SELECT abm_utility.func(b) FROM t2"
+        result = mrv._replace_function_with_null_and_alias(sql, "abm_utility.func")
+        assert result is not None
+        assert "abm_utility.func(" not in result
+        assert "SELECT a FROM t1" in result
+        assert "SELECT NULL" in result or "NULL AS " in result
+        assert "FROM t2" in result
+
+    def test_function_as_argument_to_another(self):
+        """abm_variance_pkg.get_period_data_set(x) inside substrb(...) is replaced."""
+        sql = "CREATE OR REPLACE VIEW v AS SELECT substrb(abm_variance_pkg.get_period_data_set(1), 1, 10) FROM t"
+        result = mrv._replace_function_with_null_and_alias(sql, "abm_variance_pkg.get_period_data_set")
+        assert result is not None
+        assert "abm_variance_pkg.get_period_data_set(" not in result
+        assert "substrb(NULL" in result or "substrb(NULL," in result
+
 
 # ===========================================================================
 # View column list preservation

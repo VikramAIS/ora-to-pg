@@ -3621,12 +3621,62 @@ def _select_item_has_explicit_alias(item: str) -> bool:
     return False
 
 
+def _find_all_select_list_bounds(body: str) -> list[tuple[int, int]]:
+    """Return list of (start, end) for each top-level SELECT list (handles UNION/INTERSECT/EXCEPT)."""
+    bounds_list: list[tuple[int, int]] = []
+    search_from = 0
+    _sel_re = re.compile(r"\bSELECT\s+", re.IGNORECASE)
+    while True:
+        m = _sel_re.search(body, search_from)
+        if not m:
+            break
+        start = m.end()
+        depth = 0
+        in_single = False
+        i = start
+        n = len(body)
+        while i < n:
+            c = body[i]
+            if in_single:
+                if c == "'" and (i + 1 >= n or body[i + 1] != "'"):
+                    in_single = False
+                elif c == "'" and i + 1 < n and body[i + 1] == "'":
+                    i += 1
+                i += 1
+                continue
+            if c == "'":
+                in_single = True
+                i += 1
+                continue
+            if c == "(":
+                depth += 1
+                i += 1
+                continue
+            if c == ")":
+                depth -= 1
+                i += 1
+                continue
+            if depth == 0:
+                prev_is_word = i > 0 and (body[i - 1].isalnum() or body[i - 1] == "_")
+                if not prev_is_word and re.match(r"FROM\b", body[i:], re.IGNORECASE):
+                    end = i
+                    while end > start and body[end - 1] in " \t":
+                        end -= 1
+                    bounds_list.append((start, end))
+                    search_from = i
+                    break
+            i += 1
+        else:
+            break
+    return bounds_list
+
+
 def _replace_function_with_null_and_alias(sql: str, func_name: str) -> Optional[str]:
     """Replace all function calls with NULL and add alias if the column has none.
 
     When a PostgreSQL error reports 'function X does not exist', this replaces
-    each func_name(...) with NULL. For SELECT list items, if the resulting
-    expression has no alias, adds AS <alias> derived from the function name.
+    each func_name(...) with NULL everywhere (SELECT, WHERE, ON, subqueries, UNION).
+    For SELECT list items that become NULL without an alias, adds AS <alias>.
     """
     if not func_name:
         return None
@@ -3646,55 +3696,43 @@ def _replace_function_with_null_and_alias(sql: str, func_name: str) -> Optional[
     header = create_match.group(1)
     body = create_match.group(2)
 
-    bounds = _find_select_list_bounds(body)
-    if not bounds:
+    # Step 1: Global replace of func(...) with NULL everywhere (SELECT, WHERE, ON, subqueries, UNION)
+    body = _replace_function_call_with_null(body, func_name)
+    if body == create_match.group(2):
         return None
-    start, end = bounds
-    select_list = body[start:end]
-    parts = _split_top_level_commas(select_list)
 
-    func_check = re.compile(
-        r'(?:[a-zA-Z_][a-zA-Z0-9_]*\s*\.\s*)?' + re.escape(bare_func) + r'\s*\(',
-        re.IGNORECASE,
-    )
-    if "." in func_name:
-        schema_part = func_name.split(".", 1)[0]
-        func_check = re.compile(
-            r'(?:(?:' + re.escape(schema_part) + r'\s*\.\s*)?' + re.escape(bare_func) + r')\s*\(',
-            re.IGNORECASE,
-        )
-
-    new_parts = []
+    # Step 2: Add aliases for SELECT items that are NULL-like without explicit alias
+    bounds_list = _find_all_select_list_bounds(body)
     alias_counter = [0]
-    changed = False
 
-    for part in parts:
-        stripped = part.strip()
-        if not func_check.search(stripped):
-            new_parts.append(stripped)
-            continue
-        replaced = _replace_function_call_with_null(stripped, func_name)
-        if replaced != stripped:
-            changed = True
-        if not _select_item_has_explicit_alias(replaced):
-            alias_counter[0] += 1
-            alias_suffix = f"_{alias_counter[0]}" if alias_counter[0] > 1 else ""
-            new_parts.append(f"{replaced} AS {alias_base}{alias_suffix}")
-            changed = True
-        else:
-            new_parts.append(replaced)
+    def fix_select_list(select_text: str) -> str:
+        parts = _split_top_level_commas(select_text)
+        new_parts = []
+        for part in parts:
+            stripped = part.strip()
+            needs_alias = (
+                not _select_item_has_explicit_alias(stripped)
+                and re.search(r'\bNULL\b', stripped, re.IGNORECASE)
+            )
+            if needs_alias:
+                alias_counter[0] += 1
+                suffix = f"_{alias_counter[0]}" if alias_counter[0] > 1 else ""
+                new_parts.append(f"{stripped} AS {alias_base}{suffix}")
+            else:
+                new_parts.append(stripped)
+        return ", ".join(new_parts)
 
-    if not changed:
-        return None
+    if bounds_list:
+        new_body_parts = []
+        prev_end = 0
+        for start, end in bounds_list:
+            new_body_parts.append(body[prev_end:start])
+            new_body_parts.append(fix_select_list(body[start:end]))
+            prev_end = end
+        new_body_parts.append(body[prev_end:])
+        body = "".join(new_body_parts)
 
-    new_select = ", ".join(new_parts)
-    body = body[:start] + new_select + body[end:]
-    sql = header + body
-
-    # Replace function calls in WHERE/ON with NULL
-    sql = _replace_function_call_with_null(sql, func_name)
-
-    return sql
+    return header + body
 
 
 def _remove_function_references(sql: str, func_name: str) -> Optional[str]:
