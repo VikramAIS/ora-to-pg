@@ -2934,15 +2934,18 @@ def apply_qualify_unqualified_refs(
     """
     Final step: qualify unqualified tables/views in the view body using Oracle object type and APPS/APPS2 rules.
     Returns updated pg_sql (CREATE OR REPLACE VIEW ... AS body).
+    Preserves explicit column list (col1, col2) when present.
     When schema_objects_cache is provided, qualification uses it (no per-ref Oracle queries).
     """
-    view_name_match = _CREATE_OR_REPLACE_VIEW_AS_PATTERN.search(pg_sql)
-    if not view_name_match:
+    create_match = _NORMALIZE_CREATE_VIEW_PATTERN.search(pg_sql)
+    if not create_match:
         return pg_sql
-    view_name_in_ddl = view_name_match.group(1)
-    body = _body_from_create_view_ddl(pg_sql)
+    view_name_in_ddl = create_match.group(1).strip()
+    column_list_raw = create_match.group(2)
+    body = create_match.group(3)
     body = _qualify_unqualified_refs_in_body(body, view_schema, connection, schema_objects_cache)
-    return f"CREATE OR REPLACE VIEW {view_name_in_ddl} AS\n{body}\n;"
+    column_list_suffix = f" {column_list_raw}" if column_list_raw else " "
+    return f"CREATE OR REPLACE VIEW {view_name_in_ddl}{column_list_suffix}AS\n{body}\n;"
 
 
 def topological_sort(
