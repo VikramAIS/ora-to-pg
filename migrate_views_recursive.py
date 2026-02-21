@@ -5898,8 +5898,14 @@ class RecursiveViewMigrator:
             log.warning("Cannot resolve relation '%s' in Oracle", relation)
             return False, None
 
-        rs_lower = resolved_schema.lower()
-        rn_lower = resolved_name.lower()
+        # Target schema for PG. For SYNONYM: resolved_* is (table_owner, table_name) - the real object,
+        # never PUBLIC (PUBLIC is the synonym owner, not the target). Oracle PUBLIC -> PG public.
+        # Empty resolved_schema -> use "public" (e.g. unqualified synonym target).
+        rs_lower = (resolved_schema or "").strip().lower() or "public"
+        rn_lower = (resolved_name or "").lower()
+        if not rn_lower:
+            log.warning("Resolved target has empty name for relation '%s'", relation)
+            return False, None
 
         if kind == "SYNONYM":
             # Resolve synonym by replacing it with target in the view SQL (no synonym-views).
