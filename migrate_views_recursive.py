@@ -5281,6 +5281,7 @@ class RecursiveViewMigrator:
         step_timeout: int = 15,
         auto_remove_columns: bool = False,
         no_qualify: bool = False,
+        create_schemas: bool = False,
         output_dir: Optional[Path] = None,
     ):
         self.oracle_conn = oracle_conn
@@ -5290,6 +5291,7 @@ class RecursiveViewMigrator:
         self.step_timeout = step_timeout
         self.auto_remove_columns = auto_remove_columns
         self.no_qualify = no_qualify
+        self.create_schemas = create_schemas
         self.output_dir = output_dir
 
         self.created: set[ViewKey] = set()
@@ -5316,6 +5318,8 @@ class RecursiveViewMigrator:
         s = (schema or "").strip().lower()
         if not s or s in self._ensured_schemas:
             return
+        if not self.create_schemas:
+            return  # Do not create new schemas
         if ensure_pg_schema(self.pg_conn, s):
             self._ensured_schemas.add(s)
             log.info("Ensured PG schema: %s", s)
@@ -6407,6 +6411,12 @@ def main() -> None:
         default=None,
         help="Optional log file path",
     )
+    parser.add_argument(
+        "--create-schemas",
+        action="store_true",
+        default=False,
+        help="Create PostgreSQL schemas if they do not exist (default: do not create)",
+    )
     args = parser.parse_args()
 
     no_execute = args.no_execute
@@ -6642,6 +6652,7 @@ def main() -> None:
         step_timeout=args.step_timeout,
         auto_remove_columns=args.auto_remove_columns,
         no_qualify=args.no_qualify,
+        create_schemas=args.create_schemas,
         output_dir=output_dir,
     )
 
