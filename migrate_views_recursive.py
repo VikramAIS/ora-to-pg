@@ -2449,7 +2449,7 @@ def _replace_userenv_to_postgres(body: str) -> str:
         if arg in ("USER", "SESSIONUSER", "SESSION_USER"):
             repl = "current_user"
         elif arg in ("LANG", "LANGUAGE"):
-            repl = "USA"
+            repl = "US"
         else:
             repl = "NULL::text"
         body = body[: match.start()] + repl + body[close + 1 :]
@@ -2866,6 +2866,28 @@ def _body_from_create_view_ddl(ddl: str) -> str:
     """Return the SELECT body from CREATE VIEW ... AS <body>."""
     match = _BODY_FROM_DDL_PATTERN.search(ddl)
     return match.group(1).strip() if match else ""
+
+
+def _extract_relation_refs_from_body(body: str) -> set[ViewKey]:
+    """Extract all relation refs (schema.name or name) from FROM/JOIN clauses.
+    Used for cycle detection: does this view reference any relation we're building?
+    """
+    refs: set[ViewKey] = set()
+    # Match relation patterns after FROM, JOIN, and comma-separated in FROM
+    pat = re.compile(
+        r"(?:FROM|JOIN|,\s*)\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s*(?:AS\s+\w+|ON\s|USING\s|,|$|\bWHERE\b|\bGROUP\b|\bORDER\b|\bHAVING\b|\bUNION\b)",
+        re.IGNORECASE,
+    )
+    for m in pat.finditer(body):
+        ref = m.group(1).strip()
+        if ref.upper() in ("SELECT", "DUAL"):
+            continue
+        if "." in ref:
+            s, n = ref.split(".", 1)
+            refs.add((s.strip().lower(), n.strip().lower()))
+        else:
+            refs.add(("", ref.strip().lower()))
+    return refs
 
 
 def get_oracle_object_type(connection, owner: str, object_name: str) -> Optional[str]:
@@ -4313,6 +4335,61 @@ def _remove_all_alias_references(sql: str, alias: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Replace relation with target (inline synonym resolution - no synonym-views)
+# ---------------------------------------------------------------------------
+
+def _replace_relation_with_target(
+    sql: str, relation: str, target_schema: str, target_name: str
+) -> Optional[str]:
+    """Replace a relation reference (synonym or different schema) with its target in the view SQL.
+
+    Inlines the target so no synonym-views are created. Handles qualified (schema.relation)
+    and unqualified (relation) refs. Skips string literals. For unqualified, only replaces
+    in FROM/JOIN context to avoid corrupting column refs (e.g. alias.column).
+    """
+    if not relation or not target_schema or not target_name:
+        return None
+    target_qual = f"{target_schema.lower()}.{target_name.lower()}"
+    original = sql
+
+    # Build pattern for the relation (as it appears in SQL)
+    if "." in relation:
+        parts = relation.split(".", 1)
+        esc_schema = re.escape(parts[0])
+        esc_table = re.escape(parts[1])
+        # Qualified: schema.relation or "schema"."relation"
+        rel_pat = re.compile(
+            r'\b"?' + esc_schema + r'"?\s*\.\s*"?' + esc_table + r'"?\b',
+            re.IGNORECASE,
+        )
+        context_agnostic = True  # safe to replace anywhere (qualified)
+    else:
+        esc_table = re.escape(relation)
+        # Unqualified: only after FROM/JOIN/, to avoid alias.column
+        rel_pat = re.compile(
+            r'(FROM|JOIN|,)\s+\b"?' + esc_table + r'"?\b(?=\s*(?:,|\bAS\b|\bON\b|\bUSING\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bHAVING\b|\bUNION\b|$))',
+            re.IGNORECASE,
+        )
+        context_agnostic = False
+
+    def do_replace(text: str) -> str:
+        if context_agnostic:
+            return rel_pat.sub(target_qual, text)
+        return rel_pat.sub(r"\1 " + target_qual, text)
+
+    # Replace outside string literals
+    parts_split = re.split(r"('(?:[^']|'')*')", sql)
+    for i in range(len(parts_split)):
+        if i % 2 == 1:
+            continue
+        parts_split[i] = do_replace(parts_split[i])
+    result = "".join(parts_split)
+    if result.strip() == original.strip():
+        return None
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Auto-remove missing relations (table/view does not exist in PG)
 # ---------------------------------------------------------------------------
 
@@ -5220,13 +5297,14 @@ class RecursiveViewMigrator:
         self._in_progress: set[ViewKey] = set()
         self._ensured_schemas: set[str] = set()
         self._created_functions: set[str] = set()
+        self.view_list_keys: set[ViewKey] = set()  # views we intend to migrate (from input)
 
         self.results: list[dict] = []  # per-view result records
         self.stats = {
             "ok": 0,
             "fail": 0,
             "skipped": 0,
-            "synonyms_created": 0,
+            "synonyms_inlined": 0,
             "deps_resolved": 0,
         }
 
@@ -5391,36 +5469,43 @@ class RecursiveViewMigrator:
     ) -> tuple[bool, str]:
         return execute_view_on_postgres(self.pg_conn, sql, schema, view_name)
 
-    # ------------------------------------------------------------------
-    # Create synonym-like view in PG
-    # ------------------------------------------------------------------
-
-    def _create_synonym_view(
-        self,
-        syn_schema: str,
-        syn_name: str,
-        target_schema: str,
-        target_name: str,
-    ) -> tuple[bool, str]:
-        """Create a VIEW in PG that acts as a synonym (SELECT * FROM target)."""
-        syn_schema_l = syn_schema.lower()
-        syn_name_l = syn_name.lower()
-        tgt_schema_l = target_schema.lower()
-        tgt_name_l = target_name.lower()
-
-        self._ensure_schema(syn_schema_l)
-        if tgt_schema_l:
-            self._ensure_schema(tgt_schema_l)
-        qualified_target = f"{tgt_schema_l}.{tgt_name_l}" if tgt_schema_l else tgt_name_l
-        sql = (
-            f"CREATE OR REPLACE VIEW {syn_schema_l}.{syn_name_l} AS\n"
-            f"SELECT * FROM {qualified_target}\n;"
-        )
-        log.info("Creating synonym-view: %s.%s -> %s", syn_schema_l, syn_name_l, qualified_target)
-        ok, err = self._execute_on_pg(sql, syn_schema_l, syn_name_l)
-        if ok:
-            self.stats["synonyms_created"] += 1
-        return ok, err
+    def _would_replace_create_cycle(
+        self, schema: str, view_name: str, pg_sql: str
+    ) -> Optional[ViewKey]:
+        """If replacing synonym-view (schema, view_name) with pg_sql would create a cycle,
+        return the (ref_schema, ref_name) that creates it; else None.
+        Checks: new def refs X, and X (in PG) refs (schema, view_name).
+        """
+        body = _body_from_create_view_ddl(pg_sql)
+        refs = _extract_relation_refs_from_body(body)
+        our_ref_patterns = [
+            f"{schema}.{view_name}".lower(),
+            f'"{schema}"."{view_name}"'.lower(),
+            view_name.lower(),
+        ]
+        try:
+            with self.pg_conn.cursor() as cur:
+                for (rs, rn) in refs:
+                    if (rs, rn) not in self.created:
+                        continue
+                    qual = f"{rs}.{rn}" if rs else rn
+                    try:
+                        cur.execute(
+                            "SELECT pg_get_viewdef(%s::regclass, true)",
+                            (qual,),
+                        )
+                    except Exception:
+                        continue
+                    row = cur.fetchone()
+                    if not row:
+                        continue
+                    def_text = (row[0] or "").lower()
+                    for pat in our_ref_patterns:
+                        if pat in def_text:
+                            return (rs, rn)
+        except Exception as e:
+            log.debug("Cycle check failed: %s", e)
+        return None
 
     # ------------------------------------------------------------------
     # Oracle function/procedure fetch & create on PG
@@ -5791,15 +5876,17 @@ class RecursiveViewMigrator:
     # ------------------------------------------------------------------
 
     def _resolve_and_create_dependency(
-        self, relation: str, parent_schema: str, depth: int
-    ) -> bool:
-        """Look up a missing PG relation in Oracle and create it.
+        self, relation: str, parent_schema: str, depth: int, current_sql: Optional[str] = None
+    ) -> tuple[bool, Optional[str]]:
+        """Look up a missing PG relation in Oracle and create it or inline its target.
 
-        Returns True if the dependency was successfully created.
+        Returns (success, modified_sql). When modified_sql is not None, the caller
+        should retry with modified_sql (synonym/relation replaced with target).
+        When modified_sql is None, retry with the same SQL.
         """
         if depth > self.MAX_RESOLVE_DEPTH:
             log.warning("Max resolve depth (%d) reached for %s", self.MAX_RESOLVE_DEPTH, relation)
-            return False
+            return False, None
 
         kind, resolved_schema, resolved_name = self._lookup_in_oracle(relation, parent_schema)
         log.info(
@@ -5809,12 +5896,13 @@ class RecursiveViewMigrator:
 
         if kind is None:
             log.warning("Cannot resolve relation '%s' in Oracle", relation)
-            return False
+            return False, None
 
         rs_lower = resolved_schema.lower()
         rn_lower = resolved_name.lower()
 
         if kind == "SYNONYM":
+            # Resolve synonym by replacing it with target in the view SQL (no synonym-views).
             target_type = None
             cached = self.schema_objects_cache.get(resolved_schema)
             if cached is not None:
@@ -5829,57 +5917,61 @@ class RecursiveViewMigrator:
                 if tgt_key not in self.created:
                     log.info("Synonym target %s.%s is a VIEW; creating it first", resolved_schema, resolved_name)
                     if not self._migrate_single(rs_lower, rn_lower, depth + 1):
-                        log.warning("Failed to create synonym target view %s.%s; cannot create synonym-view", rs_lower, rn_lower)
-                        return False
+                        log.warning("Failed to create synonym target view %s.%s", rs_lower, rn_lower)
+                        return False, None
 
-            # Determine PG schema/name for the synonym-view.
-            # Unqualified relations (public synonyms) go in "public" so search_path finds them.
-            if "." in relation:
-                syn_schema, syn_name = relation.split(".", 1)
-            else:
-                syn_schema = "public"
-                syn_name = relation
+            if current_sql:
+                modified = _replace_relation_with_target(current_sql, relation, rs_lower, rn_lower)
+                if modified:
+                    log.info("Inlined synonym: replaced '%s' with %s.%s in view definition", relation, rs_lower, rn_lower)
+                    self.stats["deps_resolved"] += 1
+                    self.stats.setdefault("synonyms_inlined", 0)
+                    self.stats["synonyms_inlined"] += 1
+                    return True, modified
+                log.warning("Could not find '%s' in SQL to replace with target %s.%s", relation, rs_lower, rn_lower)
 
-            ok, err = self._create_synonym_view(syn_schema, syn_name, rs_lower, rn_lower)
-            if ok:
-                self.stats["deps_resolved"] += 1
-                return True
-
-            # Synonym-view creation failed (target might also be missing).
-            # If target is a table that doesn't exist in PG, we can't help.
-            log.warning(
-                "Synonym-view %s.%s -> %s.%s failed: %s",
-                syn_schema, syn_name, rs_lower, rn_lower, err[:200],
-            )
-            return False
+            # Target is a table or replacement failed - no synonym-views, fail
+            if target_type == "TABLE":
+                log.warning("Synonym target %s.%s is a TABLE; tables must be migrated separately", rs_lower, rn_lower)
+            return False, None
 
         if kind == "VIEW":
             tgt_key = (rs_lower, rn_lower)
             if tgt_key in self.created:
-                return True
-            log.info("Missing relation '%s' is a VIEW in Oracle (%s.%s); creating it", relation, rs_lower, rn_lower)
-            success = self._migrate_single(rs_lower, rn_lower, depth + 1)
-            if success:
-                self.stats["deps_resolved"] += 1
-
-                # If the original relation name differs from the resolved name
-                # (e.g., relation was unqualified or in a different schema),
-                # also create a synonym-view so the original reference works.
+                # View exists; if relation name differs, inline the target instead of bridge synonym-view.
                 if "." in relation:
                     rel_schema, rel_name = relation.split(".", 1)
                 else:
                     rel_schema = parent_schema if parent_schema else "public"
                     rel_name = relation
+                rel_key = (rel_schema.lower(), rel_name.lower())
+                if rel_key != (rs_lower, rn_lower) and current_sql:
+                    modified = _replace_relation_with_target(current_sql, relation, rs_lower, rn_lower)
+                    if modified:
+                        log.info("Inlined view ref: replaced '%s' with %s.%s (bridge)", relation, rs_lower, rn_lower)
+                        self.stats["deps_resolved"] += 1
+                        return True, modified
+                return True, None
 
-                if (rel_schema.lower(), rel_name.lower()) != (rs_lower, rn_lower):
-                    ok, bridge_err = self._create_synonym_view(rel_schema, rel_name, rs_lower, rn_lower)
-                    if not ok:
-                        log.warning(
-                            "Bridge synonym-view %s.%s -> %s.%s failed: %s",
-                            rel_schema, rel_name, rs_lower, rn_lower, bridge_err[:200],
-                        )
+            log.info("Missing relation '%s' is a VIEW in Oracle (%s.%s); creating it", relation, rs_lower, rn_lower)
+            success = self._migrate_single(rs_lower, rn_lower, depth + 1)
+            if success:
+                self.stats["deps_resolved"] += 1
 
-            return success
+                # If the original relation name differs from the resolved name, inline instead of bridge synonym-view.
+                if "." in relation:
+                    rel_schema, rel_name = relation.split(".", 1)
+                else:
+                    rel_schema = parent_schema if parent_schema else "public"
+                    rel_name = relation
+                rel_key = (rel_schema.lower(), rel_name.lower())
+                if rel_key != (rs_lower, rn_lower) and current_sql:
+                    modified = _replace_relation_with_target(current_sql, relation, rs_lower, rn_lower)
+                    if modified:
+                        log.info("Inlined view ref: replaced '%s' with %s.%s (bridge)", relation, rs_lower, rn_lower)
+                        return True, modified
+
+            return success, None
 
         if kind == "TABLE":
             log.warning(
@@ -5887,9 +5979,9 @@ class RecursiveViewMigrator:
                 "Tables must be migrated separately.",
                 relation, resolved_schema, resolved_name,
             )
-            return False
+            return False, None
 
-        return False
+        return False, None
 
     # ------------------------------------------------------------------
     # Core: migrate a single view (recursive)
@@ -6016,7 +6108,9 @@ class RecursiveViewMigrator:
                 return False
             seen_relations.add(missing_rel)
 
-            resolved = self._resolve_and_create_dependency(missing_rel, schema, depth)
+            resolved, modified_sql = self._resolve_and_create_dependency(
+                missing_rel, schema, depth, current_sql=pg_sql
+            )
             if not resolved:
                 log.warning("[%s] Could not resolve dependency '%s'", display, missing_rel)
                 self._record_result(
@@ -6025,7 +6119,11 @@ class RecursiveViewMigrator:
                 )
                 return False
 
-            log.info("[%s] Dependency '%s' resolved; retrying view creation...", display, missing_rel)
+            if modified_sql:
+                pg_sql = modified_sql
+                log.info("[%s] Inlined '%s' in definition; retrying...", display, missing_rel)
+            else:
+                log.info("[%s] Dependency '%s' resolved; retrying view creation...", display, missing_rel)
 
         log.warning("[%s] Exceeded %d retries", display, self.MAX_RETRIES_PER_VIEW)
         self._record_result(schema, view_name, False, "max_retries", final_sql=pg_sql)
@@ -6066,6 +6164,7 @@ class RecursiveViewMigrator:
         Does multiple passes: views that fail in pass N might succeed in
         pass N+1 if their dependencies were created by sibling views.
         """
+        self.view_list_keys = {((s or "").lower(), (v or "").lower()) for s, v in view_list if (s or v)}
         remaining = list(view_list)
         pass_num = 0
         max_passes = 5
@@ -6174,7 +6273,7 @@ class RecursiveViewMigrator:
         print(f"  Dep views auto-created: {dep_views}", flush=True)
         print(f"  Total views in PG     : {total_created}", flush=True)
         print(f"  Dependencies resolved : {self.stats['deps_resolved']}", flush=True)
-        print(f"  Synonym-views created : {self.stats['synonyms_created']}", flush=True)
+        print(f"  Synonyms inlined       : {self.stats['synonyms_inlined']}", flush=True)
         print(f"  Functions created     : {self.stats.get('functions_created', 0)}", flush=True)
         if self.output_dir:
             print(f"  Output directory      : {self.output_dir}", flush=True)
