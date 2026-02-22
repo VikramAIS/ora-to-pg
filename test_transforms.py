@@ -2057,6 +2057,69 @@ import migrate_views_recursive as mrv
 
 
 # ===========================================================================
+# _fix_case_then_default_for_bigint
+# ===========================================================================
+class TestFixCaseThenDefaultForBigint:
+    """Tests for CASE = '0' THEN 'DEFAULT' -> = 0 THEN 0 (fixes bigint coercion error)."""
+
+    def test_prof_customer_profile_class_id_exact_pattern(self):
+        """Exact pattern from NOETIX_SYS.AR_* views: prof.customer_profile_class_id = '0' THEN 'DEFAULT'."""
+        body = (
+            "CASE WHEN prof.customer_profile_class_id = '0' THEN 'DEFAULT' "
+            "ELSE prof.customer_profile_class_id END AS customer_profile"
+        )
+        result = mrv._fix_case_then_default_for_bigint(body)
+        assert "= 0 THEN 0" in result, f"Expected = 0 THEN 0, got: {result}"
+        assert "THEN 'DEFAULT'" not in result, "Should remove 'DEFAULT' string"
+        assert "= '0'" not in result or "= 0" in result, "Should use numeric 0"
+        assert "customer_profile_class_id" in result
+        assert "END AS customer_profile" in result
+
+    def test_column_equals_zero_then_default(self):
+        """Generic: col = '0' THEN 'DEFAULT' -> col = 0 THEN 0."""
+        body = "CASE WHEN some_col = '0' THEN 'DEFAULT' ELSE some_col END"
+        result = mrv._fix_case_then_default_for_bigint(body)
+        assert "= 0 THEN 0" in result
+        assert "'DEFAULT'" not in result
+
+    def test_zero_equals_column_reversed(self):
+        """'0' = column THEN 'DEFAULT' -> 0 = column THEN 0."""
+        body = "CASE WHEN '0' = prof.customer_profile_class_id THEN 'DEFAULT' ELSE prof.customer_profile_class_id END"
+        result = mrv._fix_case_then_default_for_bigint(body)
+        assert "0 = prof.customer_profile_class_id THEN 0" in result
+        assert "'DEFAULT'" not in result
+
+    def test_no_change_without_pattern(self):
+        """CASE with other values should be unchanged."""
+        body = "CASE WHEN status = 'A' THEN 'Active' ELSE 'Inactive' END"
+        result = mrv._fix_case_then_default_for_bigint(body)
+        assert result == body
+
+    def test_no_change_then_zero(self):
+        """= 0 THEN 0 (already fixed) should be unchanged."""
+        body = "CASE WHEN id = 0 THEN 0 ELSE id END"
+        result = mrv._fix_case_then_default_for_bigint(body)
+        assert result == body
+
+    def test_multiple_occurrences(self):
+        """Multiple CASE expressions with the pattern should all be fixed."""
+        body = (
+            "SELECT CASE WHEN a.id = '0' THEN 'DEFAULT' ELSE a.id END, "
+            "CASE WHEN b.class_id = '0' THEN 'DEFAULT' ELSE b.class_id END FROM t"
+        )
+        result = mrv._fix_case_then_default_for_bigint(body)
+        assert result.count("= 0 THEN 0") == 2
+        assert result.count("'DEFAULT'") == 0
+
+    def test_double_quotes(self):
+        """= \"0\" THEN \"DEFAULT\" -> = 0 THEN 0."""
+        body = 'CASE WHEN prof.id = "0" THEN "DEFAULT" ELSE prof.id END'
+        result = mrv._fix_case_then_default_for_bigint(body)
+        assert "= 0 THEN 0" in result
+        assert '"DEFAULT"' not in result
+
+
+# ===========================================================================
 # _sanitize_alias_name
 # ===========================================================================
 class TestSanitizeAliasName:

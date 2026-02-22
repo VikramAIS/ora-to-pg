@@ -2514,10 +2514,16 @@ def _fix_case_then_default_for_bigint(body: str) -> str:
     requires all CASE branches to match the result type. When the CASE is in a bigint
     context, replace with = 0 THEN 0 (use 0 for the "default" ID case).
     """
-    # = '0' THEN 'DEFAULT' -> = 0 THEN 0  (avoids bigint coercion of 'DEFAULT')
+    # column = '0' or "0" THEN 'DEFAULT' or "DEFAULT" -> column = 0 THEN 0
     body = re.sub(
-        r"=\s*'0'\s+THEN\s+'DEFAULT'\b",
+        r"=\s*['\"]0['\"]\s+THEN\s+['\"]DEFAULT['\"](?![a-zA-Z0-9_])",
         "= 0 THEN 0",
+        body,
+        flags=re.IGNORECASE,
+    )
+    body = re.sub(
+        r"['\"]0['\"]\s*=\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s+THEN\s+['\"]DEFAULT['\"](?![a-zA-Z0-9_])",
+        r"0 = \1 THEN 0",
         body,
         flags=re.IGNORECASE,
     )
@@ -2805,6 +2811,7 @@ def normalize_view_script(
             body = _norm_step("remove_quotes_from_columns", _remove_quotes_from_columns, body)
             body = _norm_step("deduplicate_select_aliases", _deduplicate_select_aliases_in_body, body)
             body = _norm_step("sanitize_select_aliases", _sanitize_select_aliases, body)
+            body = _norm_step("case_then_default_for_bigint", _fix_case_then_default_for_bigint, body)
             body = _norm_step("cast_numeric_string_literals", _cast_numeric_string_literals_in_equality, body)
             body = _norm_step("lowercase_body_identifiers", _lowercase_body_identifiers, body)
             body = _norm_step("ensure_space_before_keywords", _ensure_space_before_keywords, body)
