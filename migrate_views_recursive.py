@@ -2449,7 +2449,7 @@ def _replace_userenv_to_postgres(body: str) -> str:
         if arg in ("USER", "SESSIONUSER", "SESSION_USER"):
             repl = "current_user"
         elif arg in ("LANG", "LANGUAGE"):
-            repl = "US"
+            repl = "'US'"
         else:
             repl = "NULL::text"
         body = body[: match.start()] + repl + body[close + 1 :]
