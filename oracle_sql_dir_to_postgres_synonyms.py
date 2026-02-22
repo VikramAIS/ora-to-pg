@@ -2456,10 +2456,10 @@ def _fix_primary_reserved_alias(body: str) -> str:
 
 def _fix_select_distinct_as(body: str) -> str:
     """
-    Fix invalid 'SELECT DISTINCT AS colname' (or 'SELECT AS colname') when the first
-    expression was removed (e.g. ROWID/function), leaving a bare AS. Insert NULL as placeholder.
+    Fix invalid 'SELECT DISTINCT AS colname' - replace DISTINCT AS with DISTINCT before execution.
+    Also fix 'SELECT AS colname' by inserting NULL as placeholder.
     """
-    body = re.sub(r'\bSELECT\s+DISTINCT\s+AS\s+', 'SELECT DISTINCT NULL AS ', body, flags=re.IGNORECASE)
+    body = re.sub(r'\bDISTINCT\s+AS\s+', 'DISTINCT ', body, flags=re.IGNORECASE)
     body = re.sub(r'\bSELECT\s+AS\s+', 'SELECT NULL AS ', body, flags=re.IGNORECASE)
     return body
 

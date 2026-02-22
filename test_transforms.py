@@ -370,7 +370,8 @@ class TestFixPrimaryAndSelectDistinctAs:
     def test_select_distinct_as_fixed(self):
         body = "SELECT DISTINCT AS parameter_id, x FROM t"
         result = mod._fix_select_distinct_as(body)
-        assert "SELECT DISTINCT NULL AS parameter_id" in result
+        assert "SELECT DISTINCT parameter_id" in result
+        assert "DISTINCT AS" not in result
 
     def test_null_text_as_null_text_fixed(self):
         body = "SELECT NULL::text AS NULL::text, a FROM t"
@@ -2054,6 +2055,61 @@ class TestRemoveRelationReferences:
 # Import the standalone migration script for testing the new functions
 # ===========================================================================
 import migrate_views_recursive as mrv
+
+
+# ===========================================================================
+# _fix_group_by_null
+# ===========================================================================
+class TestFixGroupByNull:
+    """Tests for removing NULL from GROUP BY (fixes 'non-integer constant in GROUP BY' error)."""
+
+    def test_null_first(self):
+        """GROUP BY NULL, cicd.x -> GROUP BY cicd.x."""
+        body = "SELECT x FROM t WHERE br.resource_id = cicd.resource_id GROUP BY NULL, cicd.resource_id"
+        result = mod._fix_group_by_null(body)
+        assert "GROUP BY cicd.resource_id" in result or _ws(result).endswith("GROUP BY cicd.resource_id")
+        assert "NULL" not in result or "NULLIF" in result
+
+    def test_null_last(self):
+        """GROUP BY a, NULL -> GROUP BY a."""
+        body = "SELECT a, COUNT(*) FROM t GROUP BY a, NULL"
+        result = mod._fix_group_by_null(body)
+        assert "GROUP BY a" in result
+        assert ", NULL" not in result
+
+    def test_null_middle(self):
+        """GROUP BY a, NULL, b -> GROUP BY a, b."""
+        body = "SELECT a, b, SUM(x) FROM t GROUP BY a, NULL, b"
+        result = mod._fix_group_by_null(body)
+        assert "GROUP BY a, b" in result or "GROUP BY a , b" in result
+        assert ", NULL," not in result.upper()
+
+    def test_standalone_null(self):
+        """GROUP BY NULL -> GROUP BY 1."""
+        body = "SELECT COUNT(*) FROM t GROUP BY NULL"
+        result = mod._fix_group_by_null(body)
+        assert "GROUP BY 1" in result
+        assert "GROUP BY NULL" not in result
+
+    def test_standalone_null_before_having(self):
+        """GROUP BY NULL HAVING ... -> GROUP BY 1 HAVING ..."""
+        body = "SELECT 1 FROM t GROUP BY NULL HAVING 1=1"
+        result = mod._fix_group_by_null(body)
+        assert "GROUP BY 1" in result
+        assert "GROUP BY NULL" not in result
+
+    def test_no_change_without_null(self):
+        """GROUP BY a, b should be unchanged."""
+        body = "SELECT a, b FROM t GROUP BY a, b"
+        result = mod._fix_group_by_null(body)
+        assert result == body
+
+    def test_nullif_unchanged(self):
+        """NULLIF() should not be touched."""
+        body = "SELECT NULLIF(a, b) FROM t GROUP BY NULLIF(a, b)"
+        result = mod._fix_group_by_null(body)
+        assert "NULLIF(a, b)" in result
+        assert "GROUP BY NULLIF(a, b)" in result or "GROUP BY  NULLIF(a, b)" in result
 
 
 # ===========================================================================

@@ -2488,10 +2488,10 @@ def _fix_primary_reserved_alias(body: str) -> str:
 
 def _fix_select_distinct_as(body: str) -> str:
     """
-    Fix invalid 'SELECT DISTINCT AS colname' (or 'SELECT AS colname') when the first
-    expression was removed (e.g. ROWID/function), leaving a bare AS. Insert NULL as placeholder.
+    Fix invalid 'SELECT DISTINCT AS colname' - replace DISTINCT AS with DISTINCT before execution.
+    Also fix 'SELECT AS colname' by inserting NULL as placeholder.
     """
-    body = re.sub(r'\bSELECT\s+DISTINCT\s+AS\s+', 'SELECT DISTINCT NULL AS ', body, flags=re.IGNORECASE)
+    body = re.sub(r'\bDISTINCT\s+AS\s+', 'DISTINCT ', body, flags=re.IGNORECASE)
     body = re.sub(r'\bSELECT\s+AS\s+', 'SELECT NULL AS ', body, flags=re.IGNORECASE)
     return body
 
@@ -2524,6 +2524,26 @@ def _fix_case_then_default_for_bigint(body: str) -> str:
     body = re.sub(
         r"['\"]0['\"]\s*=\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s+THEN\s+['\"]DEFAULT['\"](?![a-zA-Z0-9_])",
         r"0 = \1 THEN 0",
+        body,
+        flags=re.IGNORECASE,
+    )
+    return body
+
+
+def _fix_group_by_null(body: str) -> str:
+    """
+    Fix 'non-integer constant in GROUP BY' error. PostgreSQL does not allow NULL
+    as a grouping expression. Remove NULL from GROUP BY lists; if NULL is the
+    only item, use GROUP BY 1 (constant) so all rows form one group.
+    """
+    # Remove ", NULL" (trailing or middle)
+    body = re.sub(r",\s*NULL\b", "", body, flags=re.IGNORECASE)
+    # Remove "NULL, " (leading or middle)
+    body = re.sub(r"NULL\s*,\s*", " ", body, flags=re.IGNORECASE)
+    # Replace standalone "GROUP BY NULL" with "GROUP BY 1"
+    body = re.sub(
+        r"GROUP\s+BY\s+NULL\s*(?=\s+(?:HAVING|ORDER|LIMIT|OFFSET|\))|$)",
+        "GROUP BY 1 ",
         body,
         flags=re.IGNORECASE,
     )
@@ -2778,6 +2798,7 @@ def normalize_view_script(
             body = _norm_step("fix_null_text_as_alias", _fix_null_text_as_null_text, body)
             body = _norm_step("fix_primary_alias", _fix_primary_reserved_alias, body)
             body = _norm_step("fix_select_distinct_as", _fix_select_distinct_as, body)
+            body = _norm_step("fix_group_by_null", _fix_group_by_null, body)
             body = _norm_step("repair_identifier_space", _repair_identifier_space_before_dot, body)
             body = _norm_step("remove_outer_join_plus", _remove_outer_join_plus, body)
             body = _norm_step("nvl_nvl2_decode", _replace_nvl_nvl2_decode_in_body, body)
