@@ -2506,6 +2506,24 @@ def _fix_null_text_as_null_text(body: str) -> str:
     return body
 
 
+def _fix_case_then_default_for_bigint(body: str) -> str:
+    """
+    Fix "invalid input syntax for type bigint: 'DEFAULT'" in CASE expressions.
+
+    Oracle views use WHEN id_column = '0' THEN 'DEFAULT' as a display label; PostgreSQL
+    requires all CASE branches to match the result type. When the CASE is in a bigint
+    context, replace with = 0 THEN 0 (use 0 for the "default" ID case).
+    """
+    # = '0' THEN 'DEFAULT' -> = 0 THEN 0  (avoids bigint coercion of 'DEFAULT')
+    body = re.sub(
+        r"=\s*'0'\s+THEN\s+'DEFAULT'\b",
+        "= 0 THEN 0",
+        body,
+        flags=re.IGNORECASE,
+    )
+    return body
+
+
 def _repair_identifier_space_before_dot(body: str) -> str:
     """
     Repair identifier corruption where a space was inserted in an alias/table name (e.g. seg order.ctid -> seg_order.ctid),
@@ -4743,6 +4761,27 @@ def execute_view_with_column_retry(
                      display, from_alias, len(new_sql), len(current_sql))
             current_sql = new_sql
             continue
+
+        # --- Always handle "invalid input syntax for type bigint: 'DEFAULT'" (CASE = '0' THEN 'DEFAULT') ---
+        if err and "invalid input syntax for type bigint" in err.lower() and "default" in err.lower():
+            err_key = "bigint_default"
+            if err_key in seen_errors:
+                log.warning("[BIGINT-DEFAULT] %s: still failing after CASE fix -- giving up", display)
+                return False, err, current_sql, removed_columns
+            seen_errors.add(err_key)
+            body = _body_from_create_view_ddl(current_sql)
+            if body:
+                fixed_body = _fix_case_then_default_for_bigint(body)
+                if fixed_body != body:
+                    match = _BODY_FROM_DDL_PATTERN.search(current_sql)
+                    if match:
+                        new_sql = current_sql[: match.start(1)] + fixed_body + current_sql[match.end(1) :]
+                        log.info("[BIGINT-DEFAULT] %s: fixing CASE = '0' THEN 'DEFAULT' for bigint (attempt %d)",
+                                 display, attempt + 1)
+                        removed_columns.append("case_then_default->0")
+                        current_sql = new_sql
+                        continue
+            log.warning("[BIGINT-DEFAULT] %s: could not apply fix -- giving up", display)
 
         # --- Errors gated by auto_remove_relations ---
         if auto_remove_relations:
