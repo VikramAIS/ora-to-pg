@@ -2364,8 +2364,8 @@ def _deduplicate_select_aliases_in_body(body: str) -> str:
     unnamed_col_index = [0]
     new_parts: list[str] = []
     # Match explicit AS alias (unquoted or double-quoted): AS col_name or AS "END"
-    # Include $ in identifier chars — Oracle allows $ in identifiers (e.g. a$customer_name)
-    alias_re = re.compile(r'\s+AS\s+("?[a-zA-Z_$][a-zA-Z0-9_$]*"?)\s*$', re.IGNORECASE)
+    # Include $, #, : — Oracle allows these in identifiers (e.g. a$name, _kf:test)
+    alias_re = re.compile(r'\s+AS\s+("?[a-zA-Z_$#][a-zA-Z0-9_$#:]*"?)\s*$', re.IGNORECASE)
     implicit_alias_re = re.compile(r"\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*$")
     for part in parts:
         part_stripped = part.strip()
@@ -2837,9 +2837,9 @@ def _sanitize_select_aliases(body: str) -> str:
     changed = False
     new_parts: list[str] = []
 
-    # Trailing AS alias (unquoted) at end of item
+    # Trailing AS alias (unquoted) at end of item; include : for Oracle identifiers (e.g. _kf:test)
     trailing_as_re = re.compile(
-        r'^(.*\bAS\s+)([a-zA-Z_$#][a-zA-Z0-9_$#]*)\s*$',
+        r'^(.*\bAS\s+)([a-zA-Z_$#][a-zA-Z0-9_$#:]*)\s*$',
         re.IGNORECASE | re.DOTALL,
     )
 
@@ -2852,7 +2852,12 @@ def _sanitize_select_aliases(body: str) -> str:
 
         prefix = m.group(1)
         alias = m.group(2)
-        clean = _sanitize_alias_name(alias)
+        # Preserve and quote aliases with : or other chars outside [a-zA-Z0-9_$#];
+        # $ and # are sanitized (replaced with _) per existing behavior.
+        if re.search(r'[^a-zA-Z0-9_$#]', alias):
+            clean = _quote_alias_if_reserved(alias)
+        else:
+            clean = _sanitize_alias_name(alias)
         if clean != alias:
             new_parts.append(prefix + clean)
             changed = True
