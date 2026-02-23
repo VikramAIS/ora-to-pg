@@ -4736,6 +4736,96 @@ def _remove_relation_references(sql: str, relation: str) -> Optional[str]:
     return sql
 
 
+def remove_where_clause(sql: str) -> Optional[str]:
+    """
+    Remove the top-level WHERE clause from a CREATE VIEW SQL body.
+    Returns modified SQL, or None if no WHERE found or structure unrecognized.
+    Used when 'character varying' errors occur and --remove-where is set.
+    """
+    if not sql or "WHERE" not in sql.upper():
+        return None
+    as_match = re.search(r"\bAS\s+", sql, re.IGNORECASE)
+    if not as_match:
+        return None
+    body_start = as_match.end()
+    body = sql[body_start:]
+    depth = 0
+    in_single = False
+    where_start = -1
+    i = 0
+    while i < len(body):
+        c = body[i]
+        if in_single:
+            if c == "'" and (i + 1 >= len(body) or body[i + 1] != "'"):
+                in_single = False
+            elif c == "'" and i + 1 < len(body) and body[i + 1] == "'":
+                i += 1
+            i += 1
+            continue
+        if c == "'":
+            in_single = True
+            i += 1
+            continue
+        if c == "(":
+            depth += 1
+            i += 1
+            continue
+        if c == ")":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0:
+            where_m = re.match(r"\bWHERE\b", body[i:], re.IGNORECASE)
+            if where_m:
+                where_start = i
+                break
+        i += 1
+    if where_start < 0:
+        return None
+    end_keywords = (
+        "GROUP BY", "HAVING", "ORDER BY", "LIMIT", "OFFSET",
+        "UNION", "EXCEPT", "INTERSECT",
+    )
+    j = where_start + 5
+    while j < len(body):
+        c = body[j]
+        if in_single:
+            if c == "'" and (j + 1 >= len(body) or body[j + 1] != "'"):
+                in_single = False
+            elif c == "'" and j + 1 < len(body) and body[j + 1] == "'":
+                j += 1
+            j += 1
+            continue
+        if c == "'":
+            in_single = True
+            j += 1
+            continue
+        if c == "(":
+            depth += 1
+            j += 1
+            continue
+        if c == ")":
+            depth -= 1
+            j += 1
+            continue
+        if depth == 0 and body[j:j + 1].isspace():
+            tail = body[j:].lstrip()
+            for kw in end_keywords:
+                if tail.upper().startswith(kw):
+                    where_end = j
+                    new_body = body[:where_start].rstrip() + " " + body[where_end:].lstrip()
+                    return sql[:body_start] + new_body
+            if tail.startswith(";"):
+                where_end = j
+                new_body = body[:where_start].rstrip() + body[where_end:]
+                return sql[:body_start] + new_body
+        j += 1
+    new_body = body[:where_start].rstrip()
+    if new_body.endswith(","):
+        new_body = new_body.rstrip(",").rstrip()
+    return sql[:body_start] + new_body
+
+
 def execute_view_with_column_retry(
     connection, sql: str, view_schema: str, view_name: str,
     *, auto_remove_columns: bool = True, auto_remove_relations: bool = True,
@@ -5458,6 +5548,7 @@ class RecursiveViewMigrator:
         auto_remove_columns: bool = False,
         no_qualify: bool = False,
         create_schemas: bool = False,
+        remove_where: bool = False,
         output_dir: Optional[Path] = None,
     ):
         self.oracle_conn = oracle_conn
@@ -5468,6 +5559,7 @@ class RecursiveViewMigrator:
         self.auto_remove_columns = auto_remove_columns
         self.no_qualify = no_qualify
         self.create_schemas = create_schemas
+        self.remove_where = remove_where
         self.output_dir = output_dir
 
         self.created: set[ViewKey] = set()
@@ -6231,6 +6323,7 @@ class RecursiveViewMigrator:
         """Execute CREATE VIEW on PG; on 'relation not found', resolve and retry."""
         display = f"{schema}.{view_name}" if schema else view_name
         seen_relations: set[str] = set()
+        remove_where_tried = False
 
         for attempt in range(1, self.MAX_RETRIES_PER_VIEW + 1):
             # Execute with retry: always handles function errors (replace with NULL);
@@ -6269,6 +6362,19 @@ class RecursiveViewMigrator:
                     [f"Function does not exist (not fetched from source): {missing_func}", err[:500]], final_sql=pg_sql,
                 )
                 return False
+
+            # Check for "character varying" + --remove-where: remove WHERE clause and retry (once)
+            if (
+                self.remove_where
+                and not remove_where_tried
+                and "character varying" in (err or "").lower()
+            ):
+                modified = remove_where_clause(pg_sql)
+                if modified and modified != pg_sql:
+                    remove_where_tried = True
+                    log.info("[%s] Removing WHERE clause (character varying error); retrying", display)
+                    pg_sql = modified
+                    continue
 
             # Check for "relation does not exist"
             missing_rel = _parse_missing_relation(err)
@@ -6591,6 +6697,11 @@ def main() -> None:
         default=False,
         help="Create PostgreSQL schemas if they do not exist (default: do not create)",
     )
+    parser.add_argument(
+        "--remove-where",
+        action="store_true",
+        help="On 'character varying' error: remove WHERE clause and retry",
+    )
     args = parser.parse_args()
 
     no_execute = args.no_execute
@@ -6827,6 +6938,7 @@ def main() -> None:
         auto_remove_columns=args.auto_remove_columns,
         no_qualify=args.no_qualify,
         create_schemas=args.create_schemas,
+        remove_where=args.remove_where,
         output_dir=output_dir,
     )
 
