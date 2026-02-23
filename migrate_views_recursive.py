@@ -2540,6 +2540,46 @@ def _fix_case_then_default_for_bigint(body: str) -> str:
     return body
 
 
+def _fix_case_type_mismatch(body: str) -> str:
+    """
+    Fix 'CASE types character varying and numeric cannot be matched' by casting
+    all THEN/ELSE expressions to ::text so branches unify. Applied only to simple
+    expressions (qualified columns, NULL, literals); preserves existing ::text casts.
+    """
+    # Skip if no CASE in body
+    if "CASE" not in body.upper():
+        return body
+
+    def add_text_cast_for_then(m: re.Match) -> str:
+        expr = m.group(1)
+        # Skip if already ends with ::text
+        if expr.rstrip().endswith("::text") or expr.rstrip().endswith("::TEXT"):
+            return m.group(0)
+        return f"THEN ({expr.strip()})::text "
+
+    def add_text_cast_for_else(m: re.Match) -> str:
+        expr = m.group(1)
+        if expr.rstrip().endswith("::text") or expr.rstrip().endswith("::TEXT"):
+            return m.group(0)
+        return f"ELSE ({expr.strip()})::text "
+
+    # Match THEN/ELSE followed by: qualified column, NULL, string literal, or numeric
+    # Use lookahead to avoid consuming space before WHEN/ELSE/END
+    then_pat = re.compile(
+        r"\bTHEN\s+((?:[a-zA-Z_][a-zA-Z0-9_]*\.)*[a-zA-Z_][a-zA-Z0-9_]*|NULL|\d+(?:\.\d*)?|'[^']*')"
+        r"(?=\s+WHEN\b|\s+ELSE\b|\s+END\b)",
+        re.IGNORECASE,
+    )
+    else_pat = re.compile(
+        r"\bELSE\s+((?:[a-zA-Z_][a-zA-Z0-9_]*\.)*[a-zA-Z_][a-zA-Z0-9_]*|NULL|\d+(?:\.\d*)?|'[^']*')"
+        r"(?=\s+END\b)",
+        re.IGNORECASE,
+    )
+    body = then_pat.sub(add_text_cast_for_then, body)
+    body = else_pat.sub(add_text_cast_for_else, body)
+    return body
+
+
 def _fix_chained_as_global(body: str) -> str:
     """
     Fix chained AS (a1 AS a2 AS a3) anywhere in the body. Runs globally to catch
@@ -5027,6 +5067,27 @@ def execute_view_with_column_retry(
                         current_sql = new_sql
                         continue
             log.warning("[BIGINT-DEFAULT] %s: could not apply fix -- giving up", display)
+
+        # --- Handle "CASE types X and Y cannot be matched" (varchar + numeric mix) ---
+        if err and "case types" in err.lower() and "cannot be matched" in err.lower():
+            err_key = "case_type_mismatch"
+            if err_key in seen_errors:
+                log.warning("[CASE-TYPE] %s: still failing after CASE type fix -- giving up", display)
+                return False, err, current_sql, removed_columns
+            seen_errors.add(err_key)
+            body = _body_from_create_view_ddl(current_sql)
+            if body:
+                fixed_body = _fix_case_type_mismatch(body)
+                if fixed_body != body:
+                    match = _BODY_FROM_DDL_PATTERN.search(current_sql)
+                    if match:
+                        new_sql = current_sql[:match.start(1)] + fixed_body + current_sql[match.end(1):]
+                        log.info("[CASE-TYPE] %s: fixing CASE type mismatch (varchar/numeric) (attempt %d)",
+                                 display, attempt + 1)
+                        removed_columns.append("case_type->text")
+                        current_sql = new_sql
+                        continue
+            log.warning("[CASE-TYPE] %s: could not apply fix -- giving up", display)
 
         # --- Handle "syntax error at or near AS" (SELECT DISTINCT AS col, SELECT AS col) ---
         if err and "syntax error" in err.lower() and "as" in err.lower():
