@@ -2499,8 +2499,9 @@ def _fix_select_distinct_as(body: str) -> str:
     """
     Fix invalid 'SELECT DISTINCT AS colname' - replace DISTINCT AS with DISTINCT before execution.
     Also fix 'SELECT AS colname' by inserting NULL as placeholder.
+    Use \\s* after AS to handle DISTINCT AS"quoted" (no space) as well as DISTINCT AS col.
     """
-    body = re.sub(r'\bDISTINCT\s+AS\s+', 'DISTINCT ', body, flags=re.IGNORECASE)
+    body = re.sub(r'\bDISTINCT\s+AS\s*', 'DISTINCT ', body, flags=re.IGNORECASE)
     body = re.sub(r'\bSELECT\s+AS\s+', 'SELECT NULL AS ', body, flags=re.IGNORECASE)
     return body
 
@@ -5018,6 +5019,27 @@ def execute_view_with_column_retry(
                         current_sql = new_sql
                         continue
             log.warning("[BIGINT-DEFAULT] %s: could not apply fix -- giving up", display)
+
+        # --- Handle "syntax error at or near AS" (SELECT DISTINCT AS col, SELECT AS col) ---
+        if err and "syntax error" in err.lower() and "as" in err.lower():
+            err_key = "distinct_as"
+            if err_key in seen_errors:
+                log.warning("[DISTINCT-AS] %s: still failing after DISTINCT AS fix -- giving up", display)
+                return False, err, current_sql, removed_columns
+            seen_errors.add(err_key)
+            body = _body_from_create_view_ddl(current_sql)
+            if body:
+                fixed_body = _fix_select_distinct_as(body)
+                if fixed_body != body:
+                    match = _BODY_FROM_DDL_PATTERN.search(current_sql)
+                    if match:
+                        new_sql = current_sql[:match.start(1)] + fixed_body + current_sql[match.end(1):]
+                        log.info("[DISTINCT-AS] %s: fixing DISTINCT AS / SELECT AS syntax (attempt %d)",
+                                 display, attempt + 1)
+                        removed_columns.append("distinct_as_fix")
+                        current_sql = new_sql
+                        continue
+            log.warning("[DISTINCT-AS] %s: could not apply fix -- giving up", display)
 
         # --- Errors gated by auto_remove_relations ---
         if auto_remove_relations:
