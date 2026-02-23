@@ -2653,11 +2653,14 @@ def _fix_group_by_null(body: str) -> str:
     Fix 'non-integer constant in GROUP BY' error. PostgreSQL does not allow NULL
     as a grouping expression. Remove NULL from GROUP BY lists; if NULL is the
     only item, use GROUP BY 1 (constant) so all rows form one group.
+    IMPORTANT: Must not remove NULL from SELECT lists (e.g. "SELECT NULL AS col"
+    would become "SELECT AS col"). Use negative lookahead to skip ", NULL" when
+    followed by AS (SELECT list context).
     """
-    # Remove ", NULL" (trailing or middle)
-    body = re.sub(r",\s*NULL\b", "", body, flags=re.IGNORECASE)
-    # Remove "NULL, " (leading or middle)
-    body = re.sub(r"NULL\s*,\s*", " ", body, flags=re.IGNORECASE)
+    # Remove ", NULL" but NOT when NULL is part of "NULL AS alias" (SELECT list)
+    body = re.sub(r",\s*NULL\b(?!\s+AS\b)", "", body, flags=re.IGNORECASE)
+    # Remove "NULL, " but NOT when part of "SELECT NULL AS alias"
+    body = re.sub(r"(?<!\bSELECT\s)NULL\s*,\s*", "", body, flags=re.IGNORECASE)
     # Replace standalone "GROUP BY NULL" with "GROUP BY 1"
     body = re.sub(
         r"GROUP\s+BY\s+NULL\s*(?=\s+(?:HAVING|ORDER|LIMIT|OFFSET|\))|$)",
