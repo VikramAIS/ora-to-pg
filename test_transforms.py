@@ -2089,6 +2089,13 @@ class TestFixNullImplicitAliasAndChainedAs:
         result = mod._fix_null_implicit_alias_and_chained_as(body)
         assert result == body
 
+    def test_chained_as_in_subquery(self):
+        """Chained AS inside subquery is fixed (global pass)."""
+        body = "SELECT (SELECT a1 AS a2 AS a3 FROM t2) AS sub FROM t1"
+        result = mod._fix_null_implicit_alias_and_chained_as(body)
+        assert "NULL AS a1, NULL AS a2, NULL AS a3" in result
+        assert " AS a2 AS a3" not in result
+
 
 # ===========================================================================
 # _fix_group_by_null
@@ -2206,6 +2213,68 @@ class TestFixCaseThenDefaultForBigint:
         result = mrv._fix_case_then_default_for_bigint(body)
         assert "= 0 THEN 0" in result
         assert '"DEFAULT"' not in result
+
+
+# ===========================================================================
+# _fix_integer_char_flag (invalid input syntax for type integer: 'Y'/'N')
+# ===========================================================================
+class TestFixIntegerCharFlag:
+    """Fix numeric column compared to 'Y'/'N' -> use 1/0."""
+
+    def test_y_to_one(self):
+        err = "invalid input syntax for type integer: 'Y'"
+        body = "SELECT * FROM t WHERE delete_mark = 'Y'"
+        result = mrv._fix_integer_char_flag(body, err)
+        assert "delete_mark = 1" in result
+        assert "= 'Y'" not in result
+
+    def test_n_to_zero(self):
+        err = "invalid input syntax for type integer: 'N'"
+        body = "SELECT * FROM t WHERE flag = 'N'"
+        result = mrv._fix_integer_char_flag(body, err)
+        assert "flag = 0" in result
+        assert "= 'N'" not in result
+
+    def test_both_y_and_n(self):
+        err = "invalid input syntax for type integer: 'Y'"
+        body = "WHERE a = 'Y' AND b = 'N'"
+        result = mrv._fix_integer_char_flag(body, err)
+        assert "a = 1" in result
+        assert "b = 0" in result
+
+    def test_no_change_without_error_pattern(self):
+        body = "WHERE x = 'Y'"
+        result = mrv._fix_integer_char_flag(body, "some other error")
+        assert result == body
+
+    def test_no_change_when_error_has_no_y_n(self):
+        body = "WHERE x = 'Y'"
+        result = mrv._fix_integer_char_flag(body, "invalid input syntax for type integer: 'YES'")
+        assert result == body
+
+
+# ===========================================================================
+# _fix_case_type_mismatch (varchar/numeric, timestamp/double)
+# ===========================================================================
+class TestFixCaseTypeMismatch:
+    """CASE branches cast to ::text for type unification."""
+
+    def test_simple_column_then_else(self):
+        body = "CASE WHEN x > 0 THEN a.col ELSE b.val END"
+        result = mrv._fix_case_type_mismatch(body)
+        assert "(a.col)::text" in result
+        assert "(b.val)::text" in result
+
+    def test_timestamp_and_double_with_now(self):
+        """CASE mixing NOW() (timestamp) and double col -> cast both to text."""
+        body = "CASE WHEN x THEN NOW() ELSE y.amount END"
+        result = mrv._fix_case_type_mismatch(body)
+        assert "(NOW())::text" in result
+        assert "(y.amount)::text" in result
+
+    def test_no_change_without_case(self):
+        body = "SELECT a, b FROM t"
+        assert mrv._fix_case_type_mismatch(body) == body
 
 
 # ===========================================================================
@@ -2501,7 +2570,7 @@ class TestQuoteAliasIfReserved:
 
     @pytest.mark.parametrize("word", [
         "language", "column", "primary", "references", "returning",
-        "window", "fetch", "grant", "check", "foreign", "do",
+        "window", "fetch", "freeze", "grant", "check", "foreign", "do",
         "initially", "deferrable", "array", "lateral", "only",
         "analyse", "analyze", "ilike", "is", "isnull", "notnull",
         "placing", "symmetric", "asymmetric", "variadic", "verbose",

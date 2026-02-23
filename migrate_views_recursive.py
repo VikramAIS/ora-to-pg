@@ -888,9 +888,9 @@ def _replace_oracle_misc_in_body(body: str) -> str:
             body = body[: match.start()] + f"(( {a} )::bigint | ( {b} )::bigint)" + body[close + 1 :]
         else:
             break
-    # INSTR(s, sub) 2-arg -> strpos(s, sub)
-    # INSTR(s, sub [, pos [, occurrence]]) -> strpos or helper expression
-    # 2-arg: INSTR(s, sub) -> strpos(s, sub)
+    # INSTR(s, sub) -> position(sub in s) (PostgreSQL has no instr; position is standard)
+    # INSTR(s, sub [, pos [, occurrence]]) -> position or helper expression
+    # 2-arg: INSTR(s, sub) -> position((sub)::text in (s)::text)
     # 3-arg: INSTR(s, sub, pos) -> strpos(substring(s, pos), sub) + pos - 1  (pos > 0)
     # 4-arg: INSTR(s, sub, pos, occ) -> approximate via strpos (occurrence support limited)
     pattern = re.compile(r"\bINSTR\s*\(", re.IGNORECASE)
@@ -907,19 +907,19 @@ def _replace_oracle_misc_in_body(body: str) -> str:
         args = _split_top_level_commas(inner)
         if len(args) == 2:
             s, sub = args[0].strip(), args[1].strip()
-            repl = f"strpos(( {s} )::text, ( {sub} )::text)"
+            repl = f"position(( {sub} )::text in ( {s} )::text)"
             body = body[: match.start()] + repl + body[close + 1 :]
             instr_start = match.start() + len(repl)
         elif len(args) == 3:
             s, sub, pos = args[0].strip(), args[1].strip(), args[2].strip()
-            # strpos(substring(s from pos), sub) + pos - 1 (when pos > 0)
-            repl = f"(CASE WHEN strpos(substring(( {s} )::text, ( {pos} )::int), ( {sub} )::text) > 0 THEN strpos(substring(( {s} )::text, ( {pos} )::int), ( {sub} )::text) + ( {pos} )::int - 1 ELSE 0 END)"
+            # position(sub in substring(s from pos)) + pos - 1 (when pos > 0)
+            repl = f"(CASE WHEN position(( {sub} )::text in substring(( {s} )::text from ( {pos} )::int)) > 0 THEN position(( {sub} )::text in substring(( {s} )::text from ( {pos} )::int)) + ( {pos} )::int - 1 ELSE 0 END)"
             body = body[: match.start()] + repl + body[close + 1 :]
             instr_start = match.start() + len(repl)
         elif len(args) >= 4:
-            # 4-arg: INSTR(s, sub, pos, occurrence) - approximate as 2-arg strpos (loses pos/occurrence)
+            # 4-arg: INSTR(s, sub, pos, occurrence) - approximate as 2-arg position (loses pos/occurrence)
             s, sub = args[0].strip(), args[1].strip()
-            repl = f"strpos(( {s} )::text, ( {sub} )::text)"
+            repl = f"position(( {sub} )::text in ( {s} )::text)"
             body = body[: match.start()] + repl + body[close + 1 :]
             instr_start = match.start() + len(repl)
         else:
@@ -1160,11 +1160,40 @@ def _replace_oracle_misc_in_body(body: str) -> str:
 
 
 def _replace_pg_unit_dd_and_substring(body: str) -> str:
-    """Fix PG-incompatible patterns: date_trunc('dd',...) -> 'day'; INTERVAL 'N dd' -> 'N day'; substring(_,_,len) -> GREATEST(len,0)."""
+    """Fix PG-incompatible patterns: date_trunc('dd',...) -> 'day'; INTERVAL 'N dd' -> 'N day';
+    Oracle SUBSTR(expr, start, length) -> substring(expr FROM start FOR length) (avoids
+    'function substr(text, numeric, numeric) does not exist'); comma-form substring(len) -> GREATEST."""
     body = re.sub(r"date_trunc\s*\(\s*['\"]dd['\"]\s*,", "date_trunc('day',", body, flags=re.IGNORECASE)
-    # PostgreSQL INTERVAL uses 'day' not 'dd' (unit "dd" not recognized for type timestamp with time zone)
+    # PostgreSQL INTERVAL uses 'day' not 'dd'
     body = re.sub(r"INTERVAL\s*'\s*([\d.]+)\s*dd\s*'", r"INTERVAL '\1 day'", body, flags=re.IGNORECASE)
     body = re.sub(r"INTERVAL\s*\"\s*([\d.]+)\s*dd\s*\"", r"INTERVAL '\1 day'", body, flags=re.IGNORECASE)
+
+    # Oracle SUBSTR(expr, start [, length]) -> substring(... FROM ... FOR ...) to avoid type mismatch
+    substr_pattern = re.compile(r"\bSUBSTR\s*\(", re.IGNORECASE)
+    search_start = 0
+    while True:
+        match = substr_pattern.search(body, search_start)
+        if not match:
+            break
+        start_paren = match.end() - 1
+        close = _find_closing_paren(body, start_paren)
+        if close is None:
+            break
+        inner = body[start_paren + 1 : close].strip()
+        args = _split_top_level_commas(inner)
+        if len(args) == 2:
+            expr, start_arg = args[0].strip(), args[1].strip()
+            replacement = f"substring(( {expr} )::text FROM ( {start_arg} )::int)"
+        elif len(args) >= 3:
+            expr, start_arg, length_arg = args[0].strip(), args[1].strip(), args[2].strip()
+            replacement = f"substring(( {expr} )::text FROM ( {start_arg} )::int FOR GREATEST(( {length_arg} )::int, 0))"
+        else:
+            search_start = close + 1
+            continue
+        body = body[: match.start()] + replacement + body[close + 1 :]
+        search_start = match.start() + len(replacement)
+
+    # substring/substr in comma form (from sqlglot etc.): wrap length in GREATEST(len, 0)
     for func in ("substring", "substr"):
         pattern = re.compile(r"\b" + func + r"\s*\(", re.IGNORECASE)
         search_start = 0
@@ -2540,11 +2569,108 @@ def _fix_case_then_default_for_bigint(body: str) -> str:
     return body
 
 
+def _fix_operator_type_mismatch(body: str, err: str) -> str:
+    """
+    Fix 'operator does not exist: character varying = bigint' (and similar) by adding
+    ::text casts to unify comparison operands. Extracts the problematic snippet from
+    the error and applies (lhs)::text = (rhs)::text at that location.
+    """
+    if not err or "operator does not exist" not in err.lower():
+        return body
+    # Must involve type mismatch (varchar/numeric/bigint)
+    err_lower = err.lower()
+    if "character varying" not in err_lower and "varchar" not in err_lower:
+        return body
+    if not any(t in err_lower for t in ("bigint", "numeric", "integer")):
+        return body
+
+    # Extract snippet from "LINE N: ..." (may have leading "...")
+    line_m = re.search(r"LINE\s+\d+:\s*\.{0,3}(.+)", err, re.IGNORECASE | re.DOTALL)
+    if not line_m:
+        return body
+    snippet = line_m.group(1).strip()
+    # Truncate at HINT or newline
+    hint_pos = snippet.find("\n")
+    if hint_pos >= 0:
+        snippet = snippet[:hint_pos]
+    hint_pos = snippet.find("HINT:")
+    if hint_pos >= 0:
+        snippet = snippet[:hint_pos].strip()
+
+    # Find "left = right" pattern - left/right can be (qual.col), qual.col, or col
+    # Match: (optional parens + identifier chain) = (optional parens + identifier chain)
+    cmp_pat = re.compile(
+        r"((?:\([^)]*\)|[a-zA-Z_][a-zA-Z0-9_.]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*))\s*=\s*"
+        r"((?:\([^)]*\)|[a-zA-Z_][a-zA-Z0-9_.]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*))",
+        re.IGNORECASE,
+    )
+    m = cmp_pat.search(snippet)
+    if not m:
+        # Try IN: col IN (SELECT...) or (col) IN (SELECT...)
+        in_m = re.search(
+            r"(?:\(?([a-zA-Z_][a-zA-Z0-9_.]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\)?)\s+IN\s*\(\s*SELECT",
+            snippet,
+            re.IGNORECASE,
+        )
+        if in_m:
+            lhs = in_m.group(1).strip()
+            # Cast column to text: col IN (...) or (col) IN (...)
+            sub_pat = re.compile(rf"(\b{re.escape(lhs)}\b)\s+IN\s*\(\s*SELECT", re.IGNORECASE)
+            new_body = sub_pat.sub(r"(\1)::text IN (SELECT", body, count=1)
+            if new_body == body:
+                new_body = body.replace(f"({lhs}) IN (SELECT", f"({lhs})::text IN (SELECT", 1)
+            return new_body if new_body != body else body
+        return body
+
+    lhs_snippet, rhs_snippet = m.group(1).strip(), m.group(2).strip()
+    # Search for this comparison in body (snippet may be truncated)
+    idx = body.find(lhs_snippet)
+    if idx < 0:
+        # Try without outer parens
+        lhs_alt = lhs_snippet.strip("()").strip()
+        idx = body.find(lhs_alt) if lhs_alt else -1
+    if idx >= 0:
+        rest = body[idx:]
+        full_m = cmp_pat.match(rest)
+        if full_m:
+            lhs_full = full_m.group(1).strip()
+            rhs_full = full_m.group(2).strip()
+            if "::text" in lhs_full or "::text" in rhs_full:
+                return body
+            lhs_wrap = f"({lhs_full})" if not (lhs_full.startswith("(") and lhs_full.endswith(")")) else lhs_full
+            rhs_wrap = f"({rhs_full})" if not (rhs_full.startswith("(") and rhs_full.endswith(")")) else rhs_full
+            repl = f"{lhs_wrap}::text = {rhs_wrap}::text"
+            return body[:idx] + repl + rest[full_m.end():]
+    return body
+
+
+def _fix_integer_char_flag(body: str, err: str) -> str:
+    """
+    Fix 'invalid input syntax for type integer: Y/N' by replacing character flags
+    with numeric equivalents. When a numeric column is compared to 'Y'/'N', use
+    1/0 instead. Applies to integer, bigint, numeric, smallint.
+    """
+    err_lower = (err or "").lower()
+    if "invalid input syntax for type" not in err_lower:
+        return body
+    # Only apply when the bad value is exactly 'Y' or 'N' (not 'YES', 'NO', etc.)
+    if not re.search(r":\s*['\"]y['\"]", err_lower) and not re.search(r":\s*['\"]n['\"]", err_lower):
+        return body
+
+    original = body
+    # Replace = 'Y' / = 'N' (and variants) with = 1 / = 0 (exact 'Y'/'N', not 'YES'/'NO')
+    body = re.sub(r"=\s*'Y'", "= 1", body, flags=re.IGNORECASE)
+    body = re.sub(r"=\s*'N'", "= 0", body, flags=re.IGNORECASE)
+    body = re.sub(r'=\s*"Y"', "= 1", body, flags=re.IGNORECASE)
+    body = re.sub(r'=\s*"N"', "= 0", body, flags=re.IGNORECASE)
+    return body if body != original else original
+
+
 def _fix_case_type_mismatch(body: str) -> str:
     """
-    Fix 'CASE types character varying and numeric cannot be matched' by casting
-    all THEN/ELSE expressions to ::text so branches unify. Applied only to simple
-    expressions (qualified columns, NULL, literals); preserves existing ::text casts.
+    Fix 'CASE types ... cannot be matched' (varchar/numeric, timestamp/double, etc.)
+    by casting all THEN/ELSE expressions to ::text so branches unify. Handles:
+    qualified columns, NULL, literals, and zero-arg functions (NOW, CURRENT_TIMESTAMP).
     """
     # Skip if no CASE in body
     if "CASE" not in body.upper():
@@ -2563,15 +2689,15 @@ def _fix_case_type_mismatch(body: str) -> str:
             return m.group(0)
         return f"ELSE ({expr.strip()})::text "
 
-    # Match THEN/ELSE followed by: qualified column, NULL, string literal, or numeric
-    # Use lookahead to avoid consuming space before WHEN/ELSE/END
+    # Match THEN/ELSE followed by: qualified column, NULL, literal, numeric, or zero-arg func
+    # Zero-arg func handles NOW(), CURRENT_TIMESTAMP, etc. for timestamp/double mix
     then_pat = re.compile(
-        r"\bTHEN\s+((?:[a-zA-Z_][a-zA-Z0-9_]*\.)*[a-zA-Z_][a-zA-Z0-9_]*|NULL|\d+(?:\.\d*)?|'[^']*')"
+        r"\bTHEN\s+((?:[a-zA-Z_][a-zA-Z0-9_]*\.)*[a-zA-Z_][a-zA-Z0-9_]*(?:\s*\(\s*\))?|NULL|\d+(?:\.\d*)?|'[^']*')"
         r"(?=\s+WHEN\b|\s+ELSE\b|\s+END\b)",
         re.IGNORECASE,
     )
     else_pat = re.compile(
-        r"\bELSE\s+((?:[a-zA-Z_][a-zA-Z0-9_]*\.)*[a-zA-Z_][a-zA-Z0-9_]*|NULL|\d+(?:\.\d*)?|'[^']*')"
+        r"\bELSE\s+((?:[a-zA-Z_][a-zA-Z0-9_]*\.)*[a-zA-Z_][a-zA-Z0-9_]*(?:\s*\(\s*\))?|NULL|\d+(?:\.\d*)?|'[^']*')"
         r"(?=\s+END\b)",
         re.IGNORECASE,
     )
@@ -4972,6 +5098,25 @@ def execute_view_with_column_retry(
         func_name = _parse_missing_function(err)
         log.debug("[RETRY] %s: _parse_missing_function -> %s", display, func_name)
         if func_name:
+            # INSTR/SUBSTR: convert to PostgreSQL position/substring instead of replacing with NULL
+            if func_name.lower() in ("instr", "substr"):
+                err_key = f"conv|{func_name}"
+                if err_key not in seen_errors:
+                    seen_errors.add(err_key)
+                    body = _body_from_create_view_ddl(current_sql)
+                    if body:
+                        orig_body = body
+                        body = _replace_oracle_misc_in_body(body)  # converts INSTR -> position
+                        body = _replace_pg_unit_dd_and_substring(body)  # converts SUBSTR -> substring
+                        if body != orig_body:
+                            match = _BODY_FROM_DDL_PATTERN.search(current_sql)
+                            if match:
+                                new_sql = current_sql[:match.start(1)] + body + current_sql[match.end(1):]
+                                log.info("[INSTR-SUBSTR] %s: converting %s to PostgreSQL equivalent (attempt %d)",
+                                         display, func_name, attempt + 1)
+                                removed_columns.append(f"conv:{func_name}")
+                                current_sql = new_sql
+                                continue
             err_key = f"func|{func_name}"
             if err_key in seen_errors:
                 log.warning("[FUNC-REPLACE] %s: function %s still missing after replace -- giving up", display, func_name)
@@ -5068,6 +5213,50 @@ def execute_view_with_column_retry(
                         continue
             log.warning("[BIGINT-DEFAULT] %s: could not apply fix -- giving up", display)
 
+        # --- Handle "invalid input syntax for type integer: 'Y'" (numeric col vs char flag) ---
+        if err and "invalid input syntax for type" in (err or "").lower():
+            err_lower = err.lower()
+            if re.search(r":\s*['\"]y['\"]", err_lower) or re.search(r":\s*['\"]n['\"]", err_lower):
+                err_key = "integer_char_flag"
+                if err_key in seen_errors:
+                    log.warning("[INT-CHAR-FLAG] %s: still failing after Y/N->1/0 fix -- giving up", display)
+                    return False, err, current_sql, removed_columns
+                seen_errors.add(err_key)
+                body = _body_from_create_view_ddl(current_sql)
+                if body:
+                    fixed_body = _fix_integer_char_flag(body, err)
+                    if fixed_body != body:
+                        match = _BODY_FROM_DDL_PATTERN.search(current_sql)
+                        if match:
+                            new_sql = current_sql[:match.start(1)] + fixed_body + current_sql[match.end(1):]
+                            log.info("[INT-CHAR-FLAG] %s: fixing numeric col = 'Y'/'N' -> 1/0 (attempt %d)",
+                                     display, attempt + 1)
+                            removed_columns.append("int_char_flag->1/0")
+                            current_sql = new_sql
+                            continue
+                log.warning("[INT-CHAR-FLAG] %s: could not apply fix -- giving up", display)
+
+        # --- Handle "operator does not exist: character varying = bigint" (type mismatch) ---
+        if err and "operator does not exist" in err.lower() and "character varying" in err.lower():
+            err_key = "op_type_mismatch"
+            if err_key in seen_errors:
+                log.warning("[OP-TYPE] %s: still failing after operator type fix -- giving up", display)
+                return False, err, current_sql, removed_columns
+            seen_errors.add(err_key)
+            body = _body_from_create_view_ddl(current_sql)
+            if body:
+                fixed_body = _fix_operator_type_mismatch(body, err)
+                if fixed_body != body:
+                    match = _BODY_FROM_DDL_PATTERN.search(current_sql)
+                    if match:
+                        new_sql = current_sql[:match.start(1)] + fixed_body + current_sql[match.end(1):]
+                        log.info("[OP-TYPE] %s: fixing operator type mismatch (varchar/numeric) (attempt %d)",
+                                 display, attempt + 1)
+                        removed_columns.append("op_type->text")
+                        current_sql = new_sql
+                        continue
+            log.warning("[OP-TYPE] %s: could not apply fix -- giving up", display)
+
         # --- Handle "CASE types X and Y cannot be matched" (varchar + numeric mix) ---
         if err and "case types" in err.lower() and "cannot be matched" in err.lower():
             err_key = "case_type_mismatch"
@@ -5082,7 +5271,7 @@ def execute_view_with_column_retry(
                     match = _BODY_FROM_DDL_PATTERN.search(current_sql)
                     if match:
                         new_sql = current_sql[:match.start(1)] + fixed_body + current_sql[match.end(1):]
-                        log.info("[CASE-TYPE] %s: fixing CASE type mismatch (varchar/numeric) (attempt %d)",
+                        log.info("[CASE-TYPE] %s: fixing CASE type mismatch (varchar/numeric/timestamp) (attempt %d)",
                                  display, attempt + 1)
                         removed_columns.append("case_type->text")
                         current_sql = new_sql
