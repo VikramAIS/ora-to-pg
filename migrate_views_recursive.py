@@ -2530,6 +2530,45 @@ def _fix_case_then_default_for_bigint(body: str) -> str:
     return body
 
 
+def _fix_chained_as_global(body: str) -> str:
+    """
+    Fix chained AS (a1 AS a2 AS a3) anywhere in the body. Runs globally to catch
+    subqueries. Pattern requires only whitespace between parts (avoids CAST(x AS int) AS col).
+    """
+    # Match: identifier AS identifier AS identifier (one or more extra AS identifier)
+    chained_re = re.compile(
+        r'\b([a-zA-Z_$][a-zA-Z0-9_.$]*)\s+AS\s+([a-zA-Z_$][a-zA-Z0-9_.$]*)\s+AS\s+([a-zA-Z_$][a-zA-Z0-9_.$]*)(?:\s+AS\s+([a-zA-Z_$][a-zA-Z0-9_.$]*))*',
+        re.IGNORECASE,
+    )
+
+    def replacer(m: re.Match) -> str:
+        full = m.group(0)
+        # Extract all identifiers: split by AS and take non-empty parts
+        parts = re.split(r'\s+AS\s+', full, flags=re.IGNORECASE)
+        ids = [p.strip() for p in parts if p.strip()]
+        if len(ids) < 2:
+            return full
+        # If first is NULL, drop it (NULL AS a1 AS a2 -> NULL AS a1, NULL AS a2)
+        if ids[0].upper() == "NULL":
+            ids = ids[1:]
+        if ids[0].upper() in ("TRUE", "FALSE"):
+            return full
+        if len(ids) < 2:
+            return full
+        out = ", ".join(
+            f"NULL AS {_sanitize_alias_name(a) if (' ' in a or a.lower() in PG_RESERVED) else a}"
+            for a in ids
+        )
+        return out
+
+    result = body
+    prev = ""
+    while prev != result:
+        prev = result
+        result = chained_re.sub(replacer, result)
+    return result
+
+
 def _fix_null_implicit_alias_and_chained_as(body: str) -> str:
     """
     Fix two Oracle→PostgreSQL SELECT-list issues:
@@ -2542,6 +2581,7 @@ def _fix_null_implicit_alias_and_chained_as(body: str) -> str:
     """
     bounds = _find_select_list_bounds(body)
     if not bounds:
+        body = _fix_chained_as_global(body)
         return body
     start, end = bounds
     select_list = body[start:end]
@@ -2592,7 +2632,10 @@ def _fix_null_implicit_alias_and_chained_as(body: str) -> str:
             continue
         new_parts.append(part)
     new_list = ", ".join(new_parts)
-    return body[:start] + new_list + body[end:]
+    body = body[:start] + new_list + body[end:]
+    # Global pass: fix chained AS in subqueries and elsewhere
+    body = _fix_chained_as_global(body)
+    return body
 
 
 def _fix_group_by_null(body: str) -> str:
@@ -6354,10 +6397,8 @@ class RecursiveViewMigrator:
                 flush=True,
             )
 
-            if not still_failing or new_created == 0:
-                break  # no progress or nothing left
-
             remaining = still_failing
+            break  # Single pass only; no retry cycles
 
         # Mark anything still remaining as failed
         for schema, view_name in remaining if remaining else []:
