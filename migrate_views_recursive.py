@@ -107,7 +107,7 @@ PG_RESERVED = frozenset({
     "current_catalog", "current_date", "current_role", "current_schema",
     "current_time", "current_timestamp", "current_user", "default",
     "deferrable", "desc", "distinct", "do", "else", "end", "except",
-    "exists", "false", "fetch", "for", "foreign", "from", "full", "grant",
+    "exists", "false", "fetch", "for", "foreign", "from", "freeze", "full", "grant",
     "group", "having", "ilike", "in", "initially", "inner", "intersect",
     "into", "is", "isnull", "join", "language", "lateral", "leading",
     "left", "like", "limit", "localtime", "localtimestamp", "natural",
@@ -2323,9 +2323,18 @@ def _find_select_list_bounds(body: str) -> tuple[int, int] | None:
 
 
 def _quote_alias_if_reserved(alias: str) -> str:
-    """Return alias quoted for PostgreSQL if it is a reserved keyword (avoids 'syntax error at or near AS')."""
-    if alias.lower() in PG_RESERVED:
-        return f'"{alias}"'
+    """Return alias quoted for PostgreSQL if it is a reserved keyword or contains special characters
+    (avoids 'syntax error at or near AS')."""
+    if not alias:
+        return alias
+    # Quote if reserved keyword or contains special characters (not valid unquoted identifier)
+    needs_quote = (
+        alias.lower() in PG_RESERVED
+        or not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", alias)
+    )
+    if needs_quote:
+        escaped = alias.replace('"', '""')
+        return f'"{escaped}"'
     return alias
 
 
