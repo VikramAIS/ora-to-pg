@@ -2530,6 +2530,71 @@ def _fix_case_then_default_for_bigint(body: str) -> str:
     return body
 
 
+def _fix_null_implicit_alias_and_chained_as(body: str) -> str:
+    """
+    Fix two Oracle→PostgreSQL SELECT-list issues:
+
+    1. NULL with implicit alias: Oracle allows NULL "Line Item Description" (no AS).
+       Convert NULL "quoted alias" to NULL AS "quoted alias" for PostgreSQL.
+
+    2. Chained AS (invalid): When conversion corrupts NULL col1, NULL col2, NULL col3
+       into "col1 AS col2 AS col3", split back to NULL AS col1, NULL AS col2, NULL AS col3.
+    """
+    bounds = _find_select_list_bounds(body)
+    if not bounds:
+        return body
+    start, end = bounds
+    select_list = body[start:end]
+    parts = _split_top_level_commas(select_list)
+    new_parts: list[str] = []
+
+    # 1. NULL "quoted alias" -> NULL AS "quoted alias" (Oracle implicit alias)
+    null_quoted_re = re.compile(
+        r'^\s*NULL\s+"([^"]+)"\s*$',
+        re.IGNORECASE,
+    )
+
+    # 2. Chained AS: extract all AS alias parts and rebuild as NULL AS a, NULL AS b, ...
+    # Match AS followed by quoted "..." or unquoted identifier
+    as_alias_re = re.compile(
+        r'\bAS\s+("[^"]*"|[a-zA-Z_$][a-zA-Z0-9_$]*)',
+        re.IGNORECASE,
+    )
+
+    for part in parts:
+        stripped = part.strip()
+        if not stripped:
+            new_parts.append(part)
+            continue
+        # Fix NULL "quoted alias"
+        m = null_quoted_re.match(stripped)
+        if m:
+            alias = m.group(1)
+            out_alias = _sanitize_alias_name(alias) if " " in alias or alias.lower() in PG_RESERVED else alias
+            new_parts.append(f"NULL AS {out_alias}")
+            continue
+        # Fix chained AS (X AS Y AS Z -> NULL AS X, NULL AS Y, NULL AS Z)
+        # Only when no parentheses (avoids CAST(x AS int) AS col, (subq) AS x)
+        as_matches = list(as_alias_re.finditer(stripped)) if "(" not in stripped else []
+        if len(as_matches) >= 2:
+            # Build NULL AS a, NULL AS b, ... from all aliases including the "expression" part
+            # For "a AS b AS c", the first part "a" is a misplaced alias; all are aliases.
+            first_part = stripped[: as_matches[0].start()].strip()
+            aliases = [first_part]
+            for am in as_matches:
+                aliases.append(am.group(1).strip())
+            # Output: NULL AS a, NULL AS b, NULL AS c (each alias sanitized)
+            fixed = ", ".join(
+                f"NULL AS {_sanitize_alias_name(a) if (' ' in a or a.lower() in PG_RESERVED) else a}"
+                for a in aliases
+            )
+            new_parts.append(fixed)
+            continue
+        new_parts.append(part)
+    new_list = ", ".join(new_parts)
+    return body[:start] + new_list + body[end:]
+
+
 def _fix_group_by_null(body: str) -> str:
     """
     Fix 'non-integer constant in GROUP BY' error. PostgreSQL does not allow NULL
@@ -2829,6 +2894,7 @@ def normalize_view_script(
             body = _norm_step("limit_comma_syntax", _fix_limit_comma_syntax, body)
             body = _norm_step("empty_string_as_null", _oracle_empty_string_as_null, body)
             body = _norm_step("empty_string_to_null_datetime", _empty_string_to_null_for_datetime, body)
+            body = _norm_step("fix_null_implicit_alias_and_chained_as", _fix_null_implicit_alias_and_chained_as, body)
             body = _norm_step("remove_quotes_from_columns", _remove_quotes_from_columns, body)
             body = _norm_step("deduplicate_select_aliases", _deduplicate_select_aliases_in_body, body)
             body = _norm_step("sanitize_select_aliases", _sanitize_select_aliases, body)

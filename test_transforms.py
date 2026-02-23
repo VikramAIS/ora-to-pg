@@ -2058,6 +2058,39 @@ import migrate_views_recursive as mrv
 
 
 # ===========================================================================
+# _fix_null_implicit_alias_and_chained_as
+# ===========================================================================
+class TestFixNullImplicitAliasAndChainedAs:
+    """Tests for NULL implicit alias and chained AS fixes."""
+
+    def test_null_quoted_alias(self):
+        """NULL \"Line Item Description\" -> NULL AS Line_Item_Description."""
+        body = 'SELECT NULL "Line Item Description", x FROM t'
+        result = mod._fix_null_implicit_alias_and_chained_as(body)
+        assert "NULL AS" in result
+        assert "Line_Item_Description" in result
+
+    def test_chained_as_simple(self):
+        """a AS b AS c -> NULL AS a, NULL AS b, NULL AS c."""
+        body = "SELECT a AS b AS c FROM t"
+        result = mod._fix_null_implicit_alias_and_chained_as(body)
+        assert result.count("NULL AS") == 3
+        assert "NULL AS a, NULL AS b, NULL AS c" in result
+
+    def test_cast_not_fixed(self):
+        """CAST(x AS int) AS col has () so should be left unchanged."""
+        body = "SELECT CAST(x AS int) AS col FROM t"
+        result = mod._fix_null_implicit_alias_and_chained_as(body)
+        assert result == body
+
+    def test_normal_unchanged(self):
+        """Normal SELECT unchanged."""
+        body = "SELECT x, y FROM t"
+        result = mod._fix_null_implicit_alias_and_chained_as(body)
+        assert result == body
+
+
+# ===========================================================================
 # _fix_group_by_null
 # ===========================================================================
 class TestFixGroupByNull:
