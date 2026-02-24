@@ -2252,6 +2252,36 @@ class TestFixIntegerCharFlag:
         result = mrv._fix_integer_char_flag(body, "invalid input syntax for type integer: 'YES'")
         assert result == body
 
+    def test_numeric_string_bigint(self):
+        """set_of_books_id = '43' -> = 43 when error says '43'."""
+        err = 'invalid input syntax for type bigint: "43"'
+        body = "CASE WHEN glbal.set_of_books_id = '43' THEN 'USD' WHEN glbal.set_of_books_id = '44' THEN 'EUR' END"
+        result = mrv._fix_integer_char_flag(body, err)
+        assert "= 43" in result
+        assert "= 44" in result
+        assert "= '43'" not in result
+
+
+# ===========================================================================
+# _fix_interval_plus_integer, _fix_interval_to_numeric
+# ===========================================================================
+class TestFixIntervalFixes:
+    def test_interval_plus_integer(self):
+        body = "date_trunc('day', (db.period_start_date)::timestamp) - db.period_end_date + 1"
+        result = mrv._fix_interval_plus_integer(body)
+        assert "+ 1 * interval '1 day'" in result
+
+    def test_interval_to_numeric_date_subtraction(self):
+        body = "((hist.stage_end_date - hist.creation_date) * 24)::numeric"
+        result = mrv._fix_interval_to_numeric(body)
+        assert "extract(epoch" in result
+        assert "/ 3600" in result
+
+    def test_interval_to_numeric_skips_numeric_subtraction(self):
+        body = "((price - cost) * 24)::numeric"
+        result = mrv._fix_interval_to_numeric(body)
+        assert result == body
+
 
 # ===========================================================================
 # _fix_case_type_mismatch (varchar/numeric, timestamp/double)

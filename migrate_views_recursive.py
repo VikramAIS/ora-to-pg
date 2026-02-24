@@ -2646,24 +2646,107 @@ def _fix_operator_type_mismatch(body: str, err: str) -> str:
 
 def _fix_integer_char_flag(body: str, err: str) -> str:
     """
-    Fix 'invalid input syntax for type integer: Y/N' by replacing character flags
-    with numeric equivalents. When a numeric column is compared to 'Y'/'N', use
-    1/0 instead. Applies to integer, bigint, numeric, smallint.
+    Fix 'invalid input syntax for type integer/bigint: Y/N' or numeric strings like '43'.
+    When a numeric column is compared to 'Y'/'N', use 1/0. When compared to '43', use 43.
     """
     err_lower = (err or "").lower()
     if "invalid input syntax for type" not in err_lower:
         return body
-    # Only apply when the bad value is exactly 'Y' or 'N' (not 'YES', 'NO', etc.)
-    if not re.search(r":\s*['\"]y['\"]", err_lower) and not re.search(r":\s*['\"]n['\"]", err_lower):
-        return body
 
     original = body
-    # Replace = 'Y' / = 'N' (and variants) with = 1 / = 0 (exact 'Y'/'N', not 'YES'/'NO')
-    body = re.sub(r"=\s*'Y'", "= 1", body, flags=re.IGNORECASE)
-    body = re.sub(r"=\s*'N'", "= 0", body, flags=re.IGNORECASE)
-    body = re.sub(r'=\s*"Y"', "= 1", body, flags=re.IGNORECASE)
-    body = re.sub(r'=\s*"N"', "= 0", body, flags=re.IGNORECASE)
+
+    # Extract bad value from error: "for type bigint: \"USD\"" or ": '43'"
+    val_match = re.search(r"for type \w+:\s*['\"]([^'\"]+)['\"]", err, re.IGNORECASE)
+    bad_val = val_match.group(1).strip() if val_match else ""
+
+    if bad_val and (bad_val.isdigit() or (bad_val.startswith("-") and bad_val[1:].isdigit())):
+        # Numeric string in error -> replace ALL = 'N' / = "N" with = N (for any integer N)
+        # to fix set_of_books_id = '43', = '44', etc. in one pass
+        def _replace_numeric_literal(m: re.Match) -> str:
+            val = m.group(1)
+            try:
+                return f"= {int(val)}"
+            except ValueError:
+                return m.group(0)
+        body = re.sub(r"=\s*'(-?\d+)'", _replace_numeric_literal, body)
+        body = re.sub(r'=\s*"(-?\d+)"', _replace_numeric_literal, body)
+
+    # Also handle 'Y'/'N' (exact) regardless of error value
+    if re.search(r":\s*['\"]y['\"]", err_lower) or re.search(r":\s*['\"]n['\"]", err_lower):
+        body = re.sub(r"=\s*'Y'", "= 1", body, flags=re.IGNORECASE)
+        body = re.sub(r"=\s*'N'", "= 0", body, flags=re.IGNORECASE)
+        body = re.sub(r'=\s*"Y"', "= 1", body, flags=re.IGNORECASE)
+        body = re.sub(r'=\s*"N"', "= 0", body, flags=re.IGNORECASE)
+
     return body if body != original else original
+
+
+def _fix_interval_plus_integer(body: str) -> str:
+    """
+    Fix 'operator does not exist: interval + integer'. Oracle date - date = number of days;
+    PG gives interval. So (date_trunc(...) - date_col) + N fails. Convert + N to + N * interval '1 day'.
+    """
+    result = body
+    pos = 0
+    while True:
+        m = re.search(r"\bdate_trunc\s*\(", result[pos:], re.IGNORECASE)
+        if not m:
+            break
+        start = pos + m.start()
+        open_p = start + m.end() - 1
+        close = _find_closing_paren(result, open_p)
+        if close is None:
+            pos = start + 1
+            continue
+        after_dt = result[close + 1:].lstrip()
+        minus_m = re.match(r"-\s*[a-zA-Z_][a-zA-Z0-9_.]*(?:\s*\([^)]*\))?(?:\s*::\s*\w+)?\s*\+\s*(\d+)\b(?!\s*\*\s*interval)", after_dt, re.IGNORECASE)
+        if minus_m:
+            rest = result[close + 1:]
+            ws_len = len(rest) - len(rest.lstrip())
+            span_len = ws_len + len(minus_m.group(0))
+            n = minus_m.group(1)
+            span = result[close + 1:close + 1 + span_len]
+            new_span = span.replace(f" + {n}", f" + {n} * interval '1 day'")
+            result = result[:close + 1] + new_span + result[close + 1 + span_len:]
+        pos = close + 1
+    return result
+
+
+def _fix_interval_to_numeric(body: str) -> str:
+    """
+    Fix 'cannot cast type interval to numeric'. Oracle (date1 - date2) * 24 = hours (numeric);
+    PG (date1 - date2) is interval, and interval::numeric fails. Convert to extract(epoch)/3600.
+    Only applies when LHS or RHS has date-like names (_date, _time, creation_date, etc.) to avoid
+    breaking (price - cost) * 24.
+    """
+    def _looks_like_date_expr(s: str) -> bool:
+        """Heuristic: expr contains date/time-related identifier."""
+        s_lower = s.lower()
+        return any(
+            x in s_lower for x in ("_date", "_time", "creation_date", "stage_end", "start_date", "end_date", "timestamp")
+        )
+
+    def repl(m: re.Match) -> str:
+        lhs, rhs, mult = m.group(1), m.group(2), m.group(3)
+        if not (_looks_like_date_expr(lhs) or _looks_like_date_expr(rhs)):
+            return m.group(0)
+        try:
+            n = float(mult)
+        except ValueError:
+            return m.group(0)
+        if abs(n - 24) < 0.01:
+            div = "3600"
+        elif abs(n - 1) < 0.01:
+            div = "86400"
+        else:
+            div = str(int(86400 / n)) if n and n == int(n) else "86400"
+        return f"(extract(epoch from ({lhs} - {rhs})) / {div})::numeric"
+
+    pat = re.compile(
+        r"\(\s*([^()]+)\s*-\s*([^()]+)\s*\)\s*\*\s*(\d+(?:\.\d*)?)\s*(?:::\s*numeric)?",
+        re.IGNORECASE,
+    )
+    return pat.sub(repl, body)
 
 
 def _fix_case_type_mismatch(body: str) -> str:
@@ -3107,10 +3190,12 @@ def normalize_view_script(
             body = _norm_step("dual_with_pg", _replace_dual_with_pg, body)
             body = _norm_step("start_with_connect_by", _convert_start_with_connect_by_to_recursive_cte, body)
             body = _norm_step("timestamp_plus_integer", _fix_timestamp_plus_integer, body)
+            body = _norm_step("interval_plus_integer", _fix_interval_plus_integer, body)
             body = _norm_step("varchar_arithmetic", _fix_varchar_arithmetic, body)
             # Strip ::text casts from COALESCE arguments (added by sqlglot transpilation)
             body = _norm_step("strip_text_cast_in_coalesce", _strip_text_cast_in_coalesce, body)
             body = _norm_step("date_to_numeric_cast", _fix_date_to_numeric_cast, body)
+            body = _norm_step("interval_to_numeric", _fix_interval_to_numeric, body)
             body = _norm_step("current_timestamp_between_text", _fix_current_timestamp_between_text, body)
             # _fix_coalesce_type_safety is NOT run in the pipeline.
             # Without column-type information we cannot safely choose between
@@ -5213,10 +5298,13 @@ def execute_view_with_column_retry(
                         continue
             log.warning("[BIGINT-DEFAULT] %s: could not apply fix -- giving up", display)
 
-        # --- Handle "invalid input syntax for type integer: 'Y'" (numeric col vs char flag) ---
+        # --- Handle "invalid input syntax for type integer/bigint: 'Y'/'43'/..." (numeric col vs char) ---
         if err and "invalid input syntax for type" in (err or "").lower():
-            err_lower = err.lower()
-            if re.search(r":\s*['\"]y['\"]", err_lower) or re.search(r":\s*['\"]n['\"]", err_lower):
+            val_match = re.search(r"for type \w+:\s*['\"]([^'\"]+)['\"]", err, re.IGNORECASE)
+            bad_val = (val_match.group(1) or "").strip()
+            has_y_n = re.search(r":\s*['\"]y['\"]", (err or "").lower()) or re.search(r":\s*['\"]n['\"]", (err or "").lower())
+            has_numeric_val = bad_val.isdigit() or (bad_val.startswith("-") and bad_val[1:].isdigit())
+            if has_y_n or has_numeric_val:
                 err_key = "integer_char_flag"
                 if err_key in seen_errors:
                     log.warning("[INT-CHAR-FLAG] %s: still failing after Y/N->1/0 fix -- giving up", display)
@@ -5235,6 +5323,29 @@ def execute_view_with_column_retry(
                             current_sql = new_sql
                             continue
                 log.warning("[INT-CHAR-FLAG] %s: could not apply fix -- giving up", display)
+
+        # --- When "invalid input syntax for type bigint: USD" etc., try CASE type fix (mixed text/numeric) ---
+        if err and "invalid input syntax for type bigint" in (err or "").lower():
+            val_match = re.search(r"for type bigint:\s*['\"]([^'\"]+)['\"]", err, re.IGNORECASE)
+            bad_val = (val_match.group(1) or "").strip()
+            if bad_val and not (bad_val.isdigit() or (bad_val.startswith("-") and bad_val[1:].isdigit())):
+                err_key = "bigint_non_numeric"
+                if err_key in seen_errors:
+                    pass  # fall through to next retry
+                else:
+                    seen_errors.add(err_key)
+                    body = _body_from_create_view_ddl(current_sql)
+                    if body and "CASE" in body.upper():
+                        fixed_body = _fix_case_type_mismatch(body)
+                        if fixed_body != body:
+                            match = _BODY_FROM_DDL_PATTERN.search(current_sql)
+                            if match:
+                                new_sql = current_sql[:match.start(1)] + fixed_body + current_sql[match.end(1):]
+                                log.info("[BIGINT-TEXT] %s: fixing CASE returning text for bigint col (attempt %d)",
+                                         display, attempt + 1)
+                                removed_columns.append("bigint_case->text")
+                                current_sql = new_sql
+                                continue
 
         # --- Handle "operator does not exist: character varying = bigint" (type mismatch) ---
         if err and "operator does not exist" in err.lower() and "character varying" in err.lower():
@@ -5277,6 +5388,46 @@ def execute_view_with_column_retry(
                         current_sql = new_sql
                         continue
             log.warning("[CASE-TYPE] %s: could not apply fix -- giving up", display)
+
+        # --- Handle "operator does not exist: interval + integer" ---
+        if err and "operator does not exist" in (err or "").lower() and "interval" in (err or "").lower() and "integer" in (err or "").lower():
+            err_key = "interval_plus_int"
+            if err_key in seen_errors:
+                log.warning("[INTERVAL+INT] %s: still failing after interval+int fix -- giving up", display)
+                return False, err, current_sql, removed_columns
+            seen_errors.add(err_key)
+            body = _body_from_create_view_ddl(current_sql)
+            if body:
+                fixed_body = _fix_interval_plus_integer(body)
+                if fixed_body != body:
+                    match = _BODY_FROM_DDL_PATTERN.search(current_sql)
+                    if match:
+                        new_sql = current_sql[:match.start(1)] + fixed_body + current_sql[match.end(1):]
+                        log.info("[INTERVAL+INT] %s: fixing interval + integer (attempt %d)", display, attempt + 1)
+                        removed_columns.append("interval_plus_int")
+                        current_sql = new_sql
+                        continue
+            log.warning("[INTERVAL+INT] %s: could not apply fix -- giving up", display)
+
+        # --- Handle "cannot cast type interval to numeric" ---
+        if err and "cannot cast type interval to numeric" in (err or "").lower():
+            err_key = "interval_to_numeric"
+            if err_key in seen_errors:
+                log.warning("[INTERVAL-NUM] %s: still failing after interval->numeric fix -- giving up", display)
+                return False, err, current_sql, removed_columns
+            seen_errors.add(err_key)
+            body = _body_from_create_view_ddl(current_sql)
+            if body:
+                fixed_body = _fix_interval_to_numeric(body)
+                if fixed_body != body:
+                    match = _BODY_FROM_DDL_PATTERN.search(current_sql)
+                    if match:
+                        new_sql = current_sql[:match.start(1)] + fixed_body + current_sql[match.end(1):]
+                        log.info("[INTERVAL-NUM] %s: fixing interval->numeric cast (attempt %d)", display, attempt + 1)
+                        removed_columns.append("interval_to_numeric")
+                        current_sql = new_sql
+                        continue
+            log.warning("[INTERVAL-NUM] %s: could not apply fix -- giving up", display)
 
         # --- Handle "syntax error at or near AS" (SELECT DISTINCT AS col, SELECT AS col) ---
         if err and "syntax error" in err.lower() and "as" in err.lower():
