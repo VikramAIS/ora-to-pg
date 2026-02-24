@@ -2079,6 +2079,40 @@ def _strip_text_cast_in_coalesce(body: str) -> str:
     return body
 
 
+def _fix_timestamp_minus_to_numeric(body: str) -> str:
+    """Fix 'cannot cast type timestamp without time zone to numeric'.
+    Oracle: (SYSDATE - date_col) gives days (numeric). PG: (CURRENT_TIMESTAMP - timestamp) gives interval.
+    Replace (ts - expr)::numeric with (extract(epoch from (ts - expr::timestamp))/86400)::numeric.
+    """
+    _ts_kw = r"(?:CURRENT_TIMESTAMP|LOCALTIMESTAMP|CURRENT_DATE|NOW\s*\(\s*\))"
+
+    def repl(m: re.Match) -> str:
+        ts_part = m.group(1)
+        rhs = m.group(2)
+        # If rhs ends with ::numeric (wrong for date), change to ::timestamp
+        rhs_stripped = rhs.strip()
+        if re.search(r"::\s*numeric\s*$", rhs_stripped, re.IGNORECASE):
+            rhs_stripped = re.sub(r"::\s*numeric\s*$", "::timestamp", rhs_stripped, flags=re.IGNORECASE)
+        elif not re.search(r"::\s*(?:timestamp|date)\b", rhs_stripped, re.IGNORECASE):
+            rhs_stripped = f"({rhs_stripped})::timestamp"
+        return f"(extract(epoch from ({ts_part} - {rhs_stripped}))/86400)::numeric"
+
+    # Match: (ts - (ident)::numeric)::numeric or (ts - ident.ident)::numeric
+    # Pattern 1: (CURRENT_TIMESTAMP - (acct.start_date_active)::numeric)::numeric
+    pat1 = re.compile(
+        rf"\(\s*({_ts_kw})\s*-\s*\(([^)]+)\)\s*::\s*numeric\s*\)\s*::\s*numeric\b",
+        re.IGNORECASE,
+    )
+    body = pat1.sub(repl, body)
+    # Pattern 2: (ts - qual.ident)::numeric (no parens on rhs)
+    pat2 = re.compile(
+        rf"\(\s*({_ts_kw})\s*-\s*([a-zA-Z_][a-zA-Z0-9_.]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\)\s*::\s*numeric\b",
+        re.IGNORECASE,
+    )
+    body = pat2.sub(repl, body)
+    return body
+
+
 def _fix_date_to_numeric_cast(body: str) -> str:
     """Remove invalid date/timestamp → numeric casts.
 
@@ -2818,6 +2852,51 @@ def _fix_interval_to_numeric(body: str) -> str:
     return pat.sub(repl, body)
 
 
+def _fix_coalesce_type_mismatch(body: str) -> str:
+    """
+    Fix 'COALESCE types character varying and numeric cannot be matched' by casting
+    all COALESCE arguments to ::text so they unify. Oracle NVL/COALESCE implicitly
+    converts; PostgreSQL requires compatible types.
+    """
+    if "COALESCE" not in body.upper():
+        return body
+
+    result = body
+    pos = 0
+    while True:
+        m = re.search(r"\bCOALESCE\s*\(", result[pos:], re.IGNORECASE)
+        if not m:
+            break
+        start = pos + m.start()
+        open_p = pos + m.end() - 1
+        close = _find_closing_paren(result, open_p)
+        if close is None:
+            pos = start + 1
+            continue
+        inner = result[open_p + 1 : close]
+        args = _split_top_level_commas(inner)
+        if not args:
+            pos = start + 1
+            continue
+
+        new_args = []
+        for a in args:
+            stripped = a.strip()
+            if not stripped:
+                new_args.append(a)
+                continue
+            if stripped.rstrip().endswith("::text") or stripped.rstrip().endswith("::TEXT"):
+                new_args.append(a)
+                continue
+            new_args.append(f"({stripped})::text")
+
+        new_inner = ", ".join(new_args)
+        replacement = f"COALESCE({new_inner})"
+        result = result[:start] + replacement + result[close + 1 :]
+        pos = start + len(replacement)
+    return result
+
+
 def _fix_case_type_mismatch(body: str) -> str:
     """
     Fix 'CASE types ... cannot be matched' (varchar/numeric, timestamp/double, etc.)
@@ -3263,6 +3342,7 @@ def normalize_view_script(
             body = _norm_step("varchar_arithmetic", _fix_varchar_arithmetic, body)
             # Strip ::text casts from COALESCE arguments (added by sqlglot transpilation)
             body = _norm_step("strip_text_cast_in_coalesce", _strip_text_cast_in_coalesce, body)
+            body = _norm_step("timestamp_minus_to_numeric", _fix_timestamp_minus_to_numeric, body)
             body = _norm_step("date_to_numeric_cast", _fix_date_to_numeric_cast, body)
             body = _norm_step("interval_to_numeric", _fix_interval_to_numeric, body)
             body = _norm_step("current_timestamp_between_text", _fix_current_timestamp_between_text, body)
@@ -5475,6 +5555,27 @@ def execute_view_with_column_retry(
                         continue
             log.warning("[OP-TYPE] %s: could not apply fix -- giving up", display)
 
+        # --- Handle "COALESCE types X and Y cannot be matched" (varchar + numeric) ---
+        if err and "coalesce" in (err or "").lower() and "cannot be matched" in (err or "").lower():
+            err_key = "coalesce_type_mismatch"
+            if err_key in seen_errors:
+                log.warning("[COALESCE-TYPE] %s: still failing after COALESCE type fix -- giving up", display)
+                return False, err, current_sql, removed_columns
+            seen_errors.add(err_key)
+            body = _body_from_create_view_ddl(current_sql)
+            if body:
+                fixed_body = _fix_coalesce_type_mismatch(body)
+                if fixed_body != body:
+                    match = _BODY_FROM_DDL_PATTERN.search(current_sql)
+                    if match:
+                        new_sql = current_sql[:match.start(1)] + fixed_body + current_sql[match.end(1):]
+                        log.info("[COALESCE-TYPE] %s: fixing COALESCE type mismatch (varchar/numeric) (attempt %d)",
+                                 display, attempt + 1)
+                        removed_columns.append("coalesce_type->text")
+                        current_sql = new_sql
+                        continue
+            log.warning("[COALESCE-TYPE] %s: could not apply fix -- giving up", display)
+
         # --- Handle "CASE types X and Y cannot be matched" (varchar + numeric mix) ---
         if err and "case types" in err.lower() and "cannot be matched" in err.lower():
             err_key = "case_type_mismatch"
@@ -5515,6 +5616,26 @@ def execute_view_with_column_retry(
                         current_sql = new_sql
                         continue
             log.warning("[INTERVAL+INT] %s: could not apply fix -- giving up", display)
+
+        # --- Handle "cannot cast type timestamp without time zone to numeric" ---
+        if err and "cannot cast type timestamp" in (err or "").lower() and "to numeric" in (err or "").lower():
+            err_key = "timestamp_to_numeric"
+            if err_key in seen_errors:
+                log.warning("[TS-NUM] %s: still failing after timestamp->numeric fix -- giving up", display)
+                return False, err, current_sql, removed_columns
+            seen_errors.add(err_key)
+            body = _body_from_create_view_ddl(current_sql)
+            if body:
+                fixed_body = _fix_timestamp_minus_to_numeric(body)
+                if fixed_body != body:
+                    match = _BODY_FROM_DDL_PATTERN.search(current_sql)
+                    if match:
+                        new_sql = current_sql[:match.start(1)] + fixed_body + current_sql[match.end(1):]
+                        log.info("[TS-NUM] %s: fixing timestamp-minus->numeric (attempt %d)", display, attempt + 1)
+                        removed_columns.append("ts_minus_to_numeric")
+                        current_sql = new_sql
+                        continue
+            log.warning("[TS-NUM] %s: could not apply fix -- giving up", display)
 
         # --- Handle "cannot cast type interval to numeric" ---
         if err and "cannot cast type interval to numeric" in (err or "").lower():

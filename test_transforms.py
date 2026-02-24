@@ -2285,6 +2285,34 @@ class TestCrossDatabaseReference:
 
 
 # ===========================================================================
+# _fix_timestamp_minus_to_numeric (cannot cast timestamp to numeric)
+# ===========================================================================
+class TestFixTimestampMinusToNumeric:
+    def test_current_timestamp_minus_date_numeric(self):
+        body = "WHERE (CURRENT_TIMESTAMP - (acct.start_date_active)::numeric)::numeric > 0"
+        result = mrv._fix_timestamp_minus_to_numeric(body)
+        assert "extract(epoch" in result
+        assert "start_date_active)::timestamp" in result
+
+
+# ===========================================================================
+# _fix_coalesce_type_mismatch (COALESCE types varchar/numeric cannot be matched)
+# ===========================================================================
+class TestFixCoalesceTypeMismatch:
+    def test_coalesce_varchar_numeric_cast_to_text(self):
+        body = "SELECT COALESCE(inv.voucher_num, inv.doc_sequence_value) AS voucher_num FROM t"
+        result = mrv._fix_coalesce_type_mismatch(body)
+        assert "(inv.voucher_num)::text" in result
+        assert "(inv.doc_sequence_value)::text" in result
+
+    def test_coalesce_already_has_text_unchanged(self):
+        body = "COALESCE(a::text, b)"
+        result = mrv._fix_coalesce_type_mismatch(body)
+        assert "(b)::text" in result
+        assert "a::text" in result
+
+
+# ===========================================================================
 # _fix_null_comparisons (= NULL -> IS NULL, <> NULL -> IS NOT NULL)
 # ===========================================================================
 class TestFixNullComparisons:
