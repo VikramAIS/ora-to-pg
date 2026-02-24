@@ -2263,6 +2263,78 @@ class TestFixIntegerCharFlag:
 
 
 # ===========================================================================
+# _parse_cross_database_reference, cross-database ref -> NULL replace
+# ===========================================================================
+class TestCrossDatabaseReference:
+    def test_parse_cross_database_ref(self):
+        err = "cross-database references are not implemented: noetix_sys.noetix_gl_security_pkg.check_seg_security"
+        result = mrv._parse_cross_database_reference(err)
+        assert result == "noetix_sys.noetix_gl_security_pkg.check_seg_security"
+
+    def test_parse_cross_database_ref_no_match(self):
+        assert mrv._parse_cross_database_reference("function x does not exist") is None
+
+    def test_replace_cross_db_with_null(self):
+        sql = "CREATE OR REPLACE VIEW v AS SELECT noetix_sys.noetix_gl_security_pkg.check_seg_security(1, 2) AS col1 FROM t;"
+        result = mrv._replace_function_with_null_and_alias(
+            sql, "noetix_sys.noetix_gl_security_pkg.check_seg_security"
+        )
+        assert result is not None
+        assert "NULL" in result
+        assert "noetix_sys.noetix_gl_security_pkg.check_seg_security" not in result
+
+
+# ===========================================================================
+# _fix_null_comparisons (= NULL -> IS NULL, <> NULL -> IS NOT NULL)
+# ===========================================================================
+class TestFixNullComparisons:
+    def test_equals_null_to_is_null(self):
+        body = "WHERE l.LANGUAGE = NULL AND org.organization_id = NULL"
+        result = mrv._fix_null_comparisons(body)
+        assert "LANGUAGE IS NULL" in result
+        assert "organization_id IS NULL" in result
+        assert "= NULL" not in result
+
+    def test_not_equals_null_to_is_not_null(self):
+        body = "WHERE kzsrorol <> NULL"
+        result = mrv._fix_null_comparisons(body)
+        assert "IS NOT NULL" in result
+        assert "<> NULL" not in result
+
+    def test_paren_expr_equals_null(self):
+        body = "(row_number() over ()) = NULL"
+        result = mrv._fix_null_comparisons(body)
+        assert ") IS NULL" in result
+
+
+# ===========================================================================
+# _fix_sign_extract_epoch_redundant, _fix_extract_single_numeric_arg
+# ===========================================================================
+class TestFixSignAndExtract:
+    def test_sign_extract_epoch_numeric_simplified(self):
+        body = "sign(EXTRACT(EPOCH FROM (amount))::numeric)"
+        result = mrv._fix_sign_extract_epoch_redundant(body)
+        assert result == "sign(amount)"
+        assert "EXTRACT" not in result
+
+    def test_sign_extract_epoch_date_not_simplified(self):
+        body = "sign(EXTRACT(EPOCH FROM (end_date - start_date))::numeric)"
+        result = mrv._fix_sign_extract_epoch_redundant(body)
+        assert result == body
+
+    def test_extract_single_numeric_arg(self):
+        body = "SELECT extract(org_id) FROM t"
+        result = mrv._fix_extract_single_numeric_arg(body)
+        assert "extract(org_id)" not in result
+        assert "org_id" in result
+
+    def test_extract_epoch_not_replaced(self):
+        body = "EXTRACT(epoch FROM x)"
+        result = mrv._fix_extract_single_numeric_arg(body)
+        assert result == body
+
+
+# ===========================================================================
 # _fix_interval_plus_integer, _fix_interval_to_numeric
 # ===========================================================================
 class TestFixIntervalFixes:

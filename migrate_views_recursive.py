@@ -1347,6 +1347,22 @@ def _oracle_empty_string_as_null(body: str) -> str:
     return body
 
 
+def _fix_null_comparisons(body: str) -> str:
+    """Oracle allows = NULL and <> NULL; PostgreSQL requires IS NULL / IS NOT NULL.
+    Convert: column = NULL -> column IS NULL, column <> NULL / != NULL -> column IS NOT NULL.
+    Handles: col = NULL, a.b = NULL, (expr) = NULL.
+    """
+    col_ref = r"[a-zA-Z_][a-zA-Z0-9_.]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*"
+    body = re.sub(rf"\b({col_ref})\s*=\s*NULL\b", r"\1 IS NULL", body, flags=re.IGNORECASE)
+    body = re.sub(rf"\b({col_ref})\s*<>\s*NULL\b", r"\1 IS NOT NULL", body, flags=re.IGNORECASE)
+    body = re.sub(rf"\b({col_ref})\s*!=\s*NULL\b", r"\1 IS NOT NULL", body, flags=re.IGNORECASE)
+    # (expr) = NULL -> (expr) IS NULL (match ) = NULL where ) closes the expr)
+    body = re.sub(r"\)\s*=\s*NULL\b", ") IS NULL", body, flags=re.IGNORECASE)
+    body = re.sub(r"\)\s*<>\s*NULL\b", ") IS NOT NULL", body, flags=re.IGNORECASE)
+    body = re.sub(r"\)\s*!=\s*NULL\b", ") IS NOT NULL", body, flags=re.IGNORECASE)
+    return body
+
+
 def _empty_string_to_null_for_datetime(body: str) -> str:
     """('' )::date/numeric/integer etc. -> NULL::... (Oracle treats '' as NULL; PG invalid input syntax)."""
     parts = re.split(r"('(?:[^']|'')*')", body)
@@ -2281,13 +2297,56 @@ def _fix_current_timestamp_between_text(body: str) -> str:
     return body
 
 
+def _fix_sign_extract_epoch_redundant(body: str) -> str:
+    """Simplify sign(EXTRACT(EPOCH FROM (numeric))::numeric) -> sign(numeric).
+    When sign() wraps EXTRACT(EPOCH FROM x) and x is numeric (not date/interval),
+    the EXTRACT is redundant. Heuristic: simplify when inner is a simple identifier
+    without date-like suffix (_date, _time, etc.).
+    """
+    # sign(EXTRACT(EPOCH FROM (ident))::numeric) -> sign(ident) when ident has no date suffix
+    _date_suffix = re.compile(r"_date|_time|timestamp|_dt\b|_ts\b", re.IGNORECASE)
+
+    def repl(m: re.Match) -> str:
+        inner = m.group(1)
+        if _date_suffix.search(inner):
+            return m.group(0)
+        return f"sign({inner})"
+
+    pat = re.compile(
+        r"\bsign\s*\(\s*EXTRACT\s*\(\s*EPOCH\s+FROM\s+\(([^)]+)\)\s*\)\s*::\s*numeric\s*\)",
+        re.IGNORECASE,
+    )
+    return pat.sub(repl, body)
+
+
+def _fix_extract_single_numeric_arg(body: str) -> str:
+    """Remove invalid extract(numeric): EXTRACT expects (field FROM source).
+    Oracle may produce extract(some_numeric_col); PG fails. Replace with just the numeric.
+    """
+    _extract_fields = frozenset(
+        "epoch day month year hour minute second dow isodow week quarter".split()
+    )
+
+    def repl(m: re.Match) -> str:
+        ident = m.group(1).lower()
+        # Only replace when it's not a standard EXTRACT field (epoch, day, etc.)
+        if ident in _extract_fields:
+            return m.group(0)
+        return m.group(1)
+
+    pat = re.compile(r"\bEXTRACT\s*\(\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)", re.IGNORECASE)
+    return pat.sub(repl, body)
+
+
 def _fix_sign_with_interval(body: str) -> str:
     """Convert sign(expr) to sign(EXTRACT(EPOCH FROM (expr))::numeric).
 
     Oracle sign() works with dates/intervals (date subtraction returns a number).
     PostgreSQL sign() only accepts numeric; date subtraction returns an interval,
-    causing 'function sign(interval) does not exist'.
+    causing 'function sign(interval) does not exist'. Skip when expr is numeric-like
+    (simple identifier without date suffix) - _fix_sign_extract_epoch_redundant will handle.
     """
+    _date_suffix = re.compile(r"_date|_time|timestamp|_dt\b|_ts\b", re.IGNORECASE)
     pattern = re.compile(r"\bsign\s*\(", re.IGNORECASE)
     result = body
     search_start = 0
@@ -2301,6 +2360,16 @@ def _fix_sign_with_interval(body: str) -> str:
             search_start = m.end()
             continue
         inner = result[open_pos + 1 : close_pos].strip()
+        # Skip if already EXTRACT(EPOCH...) (avoid double-wrap) or if inner is numeric-like
+        if "EXTRACT" in inner.upper() or ("EPOCH" in inner.upper() and "FROM" in inner.upper()):
+            search_start = close_pos + 1
+            continue
+        if _date_suffix.search(inner) or " - " in inner or "+" in inner:
+            pass  # Likely date/interval expr, wrap it
+        else:
+            # Simple ident or number - likely numeric, don't wrap
+            search_start = close_pos + 1
+            continue
         replacement = f"sign(EXTRACT(EPOCH FROM ({inner}))::numeric)"
         result = result[: m.start()] + replacement + result[close_pos + 1 :]
         search_start = m.start() + len(replacement)
@@ -3203,8 +3272,11 @@ def normalize_view_script(
             # (breaks string context).  COALESCE type mismatches must be fixed
             # manually or via the retry script which has access to the actual error.
             body = _norm_step("sign_with_interval", _fix_sign_with_interval, body)
+            body = _norm_step("sign_extract_epoch_redundant", _fix_sign_extract_epoch_redundant, body)
+            body = _norm_step("extract_single_numeric_arg", _fix_extract_single_numeric_arg, body)
             body = _norm_step("limit_comma_syntax", _fix_limit_comma_syntax, body)
             body = _norm_step("empty_string_as_null", _oracle_empty_string_as_null, body)
+            body = _norm_step("null_comparisons", _fix_null_comparisons, body)
             body = _norm_step("empty_string_to_null_datetime", _empty_string_to_null_for_datetime, body)
             body = _norm_step("fix_null_implicit_alias_and_chained_as", _fix_null_implicit_alias_and_chained_as, body)
             body = _norm_step("remove_quotes_from_columns", _remove_quotes_from_columns, body)
@@ -4034,6 +4106,23 @@ _FUNC_NOT_EXIST_RE = re.compile(
     r'function\s+((?:[a-zA-Z_][a-zA-Z0-9_]*\.)?[a-zA-Z_][a-zA-Z0-9_]*)\s*\([^)]*\)\s+does\s+not\s+exist',
     re.IGNORECASE,
 )
+
+
+def _parse_cross_database_reference(err: str) -> Optional[str]:
+    """Extract the reference from 'cross-database references are not implemented: X' error.
+
+    Returns the fully-qualified name (e.g. noetix_sys.noetix_gl_security_pkg.check_seg_security),
+    or None if the error is not a cross-database reference error.
+    """
+    if not err or "cross-database" not in err.lower() or "not implemented" not in err.lower():
+        return None
+    m = re.search(
+        r"cross-database\s+references\s+are\s+not\s+implemented:\s*['\"]?([a-zA-Z_][a-zA-Z0-9_.]*)\b",
+        err, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip()
+    return None
 
 
 def _parse_missing_function(err: str) -> Optional[str]:
@@ -5178,6 +5267,24 @@ def execute_view_with_column_retry(
                              display, col_display, len(new_sql), len(current_sql), len(current_sql) - len(new_sql))
                     current_sql = new_sql
                     continue
+
+        # --- Handle cross-database references: replace with NULL (Oracle package calls) ---
+        cross_db_ref = _parse_cross_database_reference(err)
+        log.debug("[RETRY] %s: _parse_cross_database_reference -> %s", display, cross_db_ref)
+        if cross_db_ref:
+            err_key = f"cross_db|{cross_db_ref}"
+            if err_key in seen_errors:
+                log.warning("[CROSS-DB] %s: %s still failing after replace -- giving up", display, cross_db_ref)
+                return False, err, current_sql, removed_columns
+            seen_errors.add(err_key)
+            log.info("[CROSS-DB] %s: replacing cross-database reference %s with NULL (attempt %d)",
+                     display, cross_db_ref, attempt + 1)
+            new_sql = _replace_function_with_null_and_alias(current_sql, cross_db_ref)
+            if new_sql and new_sql.strip() != current_sql.strip():
+                removed_columns.append(f"cross_db:{cross_db_ref}")
+                current_sql = new_sql
+                continue
+            log.warning("[CROSS-DB] %s: could not replace %s in SQL -- giving up", display, cross_db_ref)
 
         # --- Always handle missing-function error: replace with NULL and add alias if needed ---
         func_name = _parse_missing_function(err)
