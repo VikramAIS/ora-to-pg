@@ -2296,6 +2296,23 @@ class TestFixTimestampMinusToNumeric:
 
 
 # ===========================================================================
+# _fix_coalesce_text_to_numeric (text - integer, text * text from COALESCE::text)
+# ===========================================================================
+class TestFixCoalesceTextToNumeric:
+    def test_coalesce_text_to_numeric_in_arithmetic(self):
+        body = "COALESCE((ae.org_id)::text, (178)::text) - 1"
+        result = mrv._fix_coalesce_text_to_numeric(body)
+        assert "COALESCE((ae.org_id)::numeric, 178)" in result
+        assert "::text" not in result or "::numeric" in result
+
+    def test_coalesce_zero_text_to_numeric(self):
+        body = "COALESCE((invs.freight_amount)::text, (0)::text) * 2"
+        result = mrv._fix_coalesce_text_to_numeric(body)
+        assert "::numeric, 0)" in result
+        assert "(0)::text" not in result
+
+
+# ===========================================================================
 # _fix_coalesce_type_mismatch (COALESCE types varchar/numeric cannot be matched)
 # ===========================================================================
 class TestFixCoalesceTypeMismatch:
@@ -2310,6 +2327,53 @@ class TestFixCoalesceTypeMismatch:
         result = mrv._fix_coalesce_type_mismatch(body)
         assert "(b)::text" in result
         assert "a::text" in result
+
+
+# ===========================================================================
+# _fix_varchar_arithmetic_type_mismatch (character varying - bigint)
+# ===========================================================================
+class TestFixVarcharArithmeticTypeMismatch:
+    def test_varchar_minus_bigint_column_cast_left(self):
+        """gllin.je_header_status - 0 when left is varchar -> (gllin.je_header_status)::numeric - 0."""
+        err = "operator does not exist: character varying - bigint\nLINE 2: gllin.je_header_status - 0"
+        body = "SELECT gllin.je_header_status - 0 AS x FROM gl_je_lines gllin"
+        result = mrv._fix_varchar_arithmetic_type_mismatch(body, err)
+        assert "(gllin.je_header_status)::numeric - 0" in result
+
+    def test_varchar_qualified_minus_number(self):
+        """qual.status - 1 -> (qual.status)::numeric - 1."""
+        err = "operator does not exist: character varying - integer\nLINE 2: qual.status - 1"
+        body = "SELECT qual.status - 1 FROM t qual"
+        result = mrv._fix_varchar_arithmetic_type_mismatch(body, err)
+        assert "(qual.status)::numeric - 1" in result
+
+    def test_bigint_minus_varchar_cast_right(self):
+        """1 - varchar_col when right is varchar -> 1 - (varchar_col)::numeric."""
+        err = "operator does not exist: bigint - character varying\nLINE 2: 1 - v.status"
+        body = "SELECT 1 - v.status FROM vendors v"
+        result = mrv._fix_varchar_arithmetic_type_mismatch(body, err)
+        assert "1 - (v.status)::numeric" in result
+
+    def test_no_change_without_line_snippet(self):
+        """Missing LINE snippet -> no fix."""
+        err = "operator does not exist: character varying - bigint"
+        body = "SELECT col - 0 FROM t"
+        result = mrv._fix_varchar_arithmetic_type_mismatch(body, err)
+        assert result == body
+
+    def test_no_change_for_equals_operator(self):
+        """= operator is handled by _fix_operator_type_mismatch, not this fix."""
+        err = "operator does not exist: character varying = bigint\nLINE 2: col = 1"
+        body = "SELECT * FROM t WHERE col = 1"
+        result = mrv._fix_varchar_arithmetic_type_mismatch(body, err)
+        assert result == body
+
+    def test_already_has_numeric_cast_unchanged(self):
+        """(col)::numeric - 0 already fixed -> unchanged."""
+        err = "operator does not exist: character varying - bigint\nLINE 2: col - 0"
+        body = "SELECT (col)::numeric - 0 FROM t"
+        result = mrv._fix_varchar_arithmetic_type_mismatch(body, err)
+        assert result == body
 
 
 # ===========================================================================

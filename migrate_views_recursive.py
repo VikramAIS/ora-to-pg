@@ -2701,7 +2701,6 @@ def _fix_operator_type_mismatch(body: str, err: str) -> str:
         snippet = snippet[:hint_pos].strip()
 
     # Find "left = right" pattern - left/right can be (qual.col), qual.col, or col
-    # Match: (optional parens + identifier chain) = (optional parens + identifier chain)
     cmp_pat = re.compile(
         r"((?:\([^)]*\)|[a-zA-Z_][a-zA-Z0-9_.]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*))\s*=\s*"
         r"((?:\([^)]*\)|[a-zA-Z_][a-zA-Z0-9_.]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*))",
@@ -2745,6 +2744,103 @@ def _fix_operator_type_mismatch(body: str, err: str) -> str:
             repl = f"{lhs_wrap}::text = {rhs_wrap}::text"
             return body[:idx] + repl + rest[full_m.end():]
     return body
+
+
+# SQL keywords that must not be treated as column refs in arithmetic
+_ARITH_KEYWORDS = frozenset(
+    {"end", "then", "when", "case", "else", "and", "or", "as", "select", "from", "where"}
+)
+
+
+def _fix_varchar_arithmetic_type_mismatch(body: str, err: str) -> str:
+    """
+    Fix 'operator does not exist: character varying - bigint' (and similar) by casting
+    the varchar operand to ::numeric so arithmetic works. Extracts the problematic
+    expression from the LINE snippet and adds (lhs)::numeric or (rhs)::numeric.
+    """
+    if not err or "operator does not exist" not in err.lower():
+        return body
+    err_lower = err.lower()
+    if "character varying" not in err_lower and "varchar" not in err_lower:
+        return body
+    if not any(t in err_lower for t in ("bigint", "numeric", "integer")):
+        return body
+    # Must be arithmetic op (not = or IN, which are handled by _fix_operator_type_mismatch)
+    op_match = re.search(
+        r"operator does not exist:\s*(?:character varying|varchar|\w+)\s*([-*+/])\s*(?:character varying|varchar|\w+)",
+        err,
+        re.IGNORECASE,
+    )
+    if not op_match:
+        return body
+    op = op_match.group(1)
+
+    # Determine which side is varchar from error: "character varying - bigint" -> left
+    # "bigint - character varying" -> right
+    type_pat = re.search(
+        r"operator does not exist:\s*(\S+(?:\s+\S+)?)\s*[-*+/]\s*(\S+(?:\s+\S+)?)",
+        err,
+        re.IGNORECASE,
+    )
+    if not type_pat:
+        return body
+    left_type, right_type = type_pat.group(1).lower(), type_pat.group(2).lower()
+    varchar_left = "character varying" in left_type or "varchar" in left_type
+    varchar_right = "character varying" in right_type or "varchar" in right_type
+    if not varchar_left and not varchar_right:
+        return body
+
+    line_m = re.search(r"LINE\s+\d+:\s*\.{0,3}(.+)", err, re.IGNORECASE | re.DOTALL)
+    if not line_m:
+        return body
+    snippet = line_m.group(1).strip()
+    for sep in ("\n", "HINT:"):
+        idx = snippet.find(sep)
+        if idx >= 0:
+            snippet = snippet[:idx].strip()
+
+    # Escape op for regex (e.g. - and * are special)
+    op_escaped = re.escape(op)
+    # Pattern: lhs op rhs - lhs/rhs can be identifier, qual.id, (expr), or number
+    arith_pat = re.compile(
+        r"((?:\([^()]*\)|[a-zA-Z_][a-zA-Z0-9_.]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*|-?\d+(?:\.\d*)?))\s*"
+        + op_escaped
+        + r"\s*((?:\([^()]*\)|[a-zA-Z_][a-zA-Z0-9_.]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*|-?\d+(?:\.\d*)?))",
+        re.IGNORECASE,
+    )
+    m = arith_pat.search(snippet)
+    if not m:
+        return body
+    lhs_snippet, rhs_snippet = m.group(1).strip(), m.group(2).strip()
+    if lhs_snippet.lower() in _ARITH_KEYWORDS or rhs_snippet.lower() in _ARITH_KEYWORDS:
+        return body
+
+    # Find in body
+    idx = body.find(lhs_snippet)
+    if idx < 0:
+        lhs_alt = lhs_snippet.strip("()").strip()
+        idx = body.find(lhs_alt) if lhs_alt else -1
+    if idx < 0:
+        return body
+    rest = body[idx:]
+    full_m = arith_pat.match(rest)
+    if not full_m:
+        return body
+    lhs_full = full_m.group(1).strip()
+    rhs_full = full_m.group(2).strip()
+    if "::numeric" in lhs_full or "::numeric" in rhs_full:
+        return body
+
+    need_paren_l = not (lhs_full.startswith("(") and lhs_full.endswith(")"))
+    need_paren_r = not (rhs_full.startswith("(") and rhs_full.endswith(")"))
+
+    if varchar_left:
+        wrap_l = f"({lhs_full})" if need_paren_l else lhs_full
+        repl = f"{wrap_l}::numeric {op} {rhs_full}"
+    else:
+        wrap_r = f"({rhs_full})" if need_paren_r else rhs_full
+        repl = f"{lhs_full} {op} {wrap_r}::numeric"
+    return body[:idx] + repl + rest[full_m.end():]
 
 
 def _fix_integer_char_flag(body: str, err: str) -> str:
@@ -2850,6 +2946,62 @@ def _fix_interval_to_numeric(body: str) -> str:
         re.IGNORECASE,
     )
     return pat.sub(repl, body)
+
+
+def _fix_coalesce_text_to_numeric(body: str) -> str:
+    """
+    Fix 'operator does not exist: text - integer' / 'text * text' caused by COALESCE
+    cast to ::text. When COALESCE((x)::text, (0)::text) is used in arithmetic, replace
+    with ::numeric so the result can participate in * - +.
+    """
+    if "COALESCE" not in body.upper():
+        return body
+
+    result = body
+    pos = 0
+    while True:
+        m = re.search(r"\bCOALESCE\s*\(", result[pos:], re.IGNORECASE)
+        if not m:
+            break
+        start = pos + m.start()
+        open_p = pos + m.end() - 1
+        close = _find_closing_paren(result, open_p)
+        if close is None:
+            pos = start + 1
+            continue
+        inner = result[open_p + 1 : close]
+        args = _split_top_level_commas(inner)
+        if not args:
+            pos = start + 1
+            continue
+
+        # Only process if at least one arg has ::text (from our COALESCE fix)
+        if not any("::text" in a or "::TEXT" in a for a in args):
+            pos = start + 1
+            continue
+
+        def conv_arg(a: str) -> str:
+            s = a.strip()
+            if not s:
+                return a
+            # (0)::text -> 0, (178)::text -> 178
+            num_m = re.match(r"\(\s*(-?\d+(?:\.\d*)?)\s*\)\s*::\s*text\s*$", s, re.IGNORECASE)
+            if num_m:
+                return num_m.group(1)
+            # (NULL)::text -> NULL
+            if re.match(r"\(\s*NULL\s*\)\s*::\s*text\s*$", s, re.IGNORECASE):
+                return "NULL"
+            # (col)::text -> (col)::numeric
+            if s.rstrip().endswith("::text") or s.rstrip().endswith("::TEXT"):
+                return re.sub(r"::\s*text\s*$", "::numeric", s.rstrip(), flags=re.IGNORECASE)
+            return a
+
+        new_args = [conv_arg(a) for a in args]
+        new_inner = ", ".join(new_args)
+        replacement = f"COALESCE({new_inner})"
+        result = result[:start] + replacement + result[close + 1 :]
+        pos = start + len(replacement)
+    return result
 
 
 def _fix_coalesce_type_mismatch(body: str) -> str:
@@ -5533,6 +5685,54 @@ def execute_view_with_column_retry(
                                 removed_columns.append("bigint_case->text")
                                 current_sql = new_sql
                                 continue
+
+        # --- Handle "operator does not exist: text - integer" / "text * text" (COALESCE::text in arithmetic) ---
+        if err and "operator does not exist" in (err or "").lower() and "text" in (err or "").lower():
+            if any(x in (err or "").lower() for x in ("text - ", "text * ", "text + ", "text / ")):
+                err_key = "text_arithmetic"
+                if err_key in seen_errors:
+                    log.warning("[TEXT-ARITH] %s: still failing after COALESCE text->numeric fix -- giving up", display)
+                    return False, err, current_sql, removed_columns
+                seen_errors.add(err_key)
+                body = _body_from_create_view_ddl(current_sql)
+                if body:
+                    fixed_body = _fix_coalesce_text_to_numeric(body)
+                    if fixed_body != body:
+                        match = _BODY_FROM_DDL_PATTERN.search(current_sql)
+                        if match:
+                            new_sql = current_sql[:match.start(1)] + fixed_body + current_sql[match.end(1):]
+                            log.info("[TEXT-ARITH] %s: fixing COALESCE ::text->numeric for arithmetic (attempt %d)",
+                                     display, attempt + 1)
+                            removed_columns.append("coalesce_text->numeric")
+                            current_sql = new_sql
+                            continue
+                log.warning("[TEXT-ARITH] %s: could not apply fix -- giving up", display)
+
+        # --- Handle "operator does not exist: character varying - bigint" (varchar in arithmetic) ---
+        if err and "operator does not exist" in (err or "").lower() and "character varying" in (err or "").lower():
+            has_arith_op = any(
+                x in (err or "").lower()
+                for x in (" - ", " * ", " + ", " / ", "- bigint", "- integer", "- numeric")
+            )
+            if has_arith_op:
+                err_key = "varchar_arithmetic"
+                if err_key in seen_errors:
+                    log.warning("[VARCHAR-ARITH] %s: still failing after varchar arithmetic fix -- giving up", display)
+                    return False, err, current_sql, removed_columns
+                seen_errors.add(err_key)
+                body = _body_from_create_view_ddl(current_sql)
+                if body:
+                    fixed_body = _fix_varchar_arithmetic_type_mismatch(body, err)
+                    if fixed_body != body:
+                        match = _BODY_FROM_DDL_PATTERN.search(current_sql)
+                        if match:
+                            new_sql = current_sql[:match.start(1)] + fixed_body + current_sql[match.end(1):]
+                            log.info("[VARCHAR-ARITH] %s: fixing varchar in arithmetic (attempt %d)",
+                                     display, attempt + 1)
+                            removed_columns.append("varchar_arithmetic->numeric")
+                            current_sql = new_sql
+                            continue
+                log.warning("[VARCHAR-ARITH] %s: could not apply fix -- giving up", display)
 
         # --- Handle "operator does not exist: character varying = bigint" (type mismatch) ---
         if err and "operator does not exist" in err.lower() and "character varying" in err.lower():
