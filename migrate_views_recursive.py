@@ -3049,6 +3049,79 @@ def _fix_coalesce_type_mismatch(body: str) -> str:
     return result
 
 
+def _find_case_end(text: str, case_start: int) -> int | None:
+    """Return index of the END that matches the CASE at case_start. Skips string literals.
+    Uses depth counting: CASE +1, END -1; returns when depth hits 0.
+    """
+    if case_start < 0 or case_start >= len(text):
+        return None
+    depth = 1
+    i = case_start + 4  # past "CASE"
+    in_single = False
+    in_double = False
+    _case_re = re.compile(r"\bCASE\b", re.IGNORECASE)
+    _end_re = re.compile(r"\bEND\b", re.IGNORECASE)
+    while i < len(text) and depth > 0:
+        if in_single:
+            if text[i] == "'" and (i + 1 >= len(text) or text[i + 1] != "'"):
+                in_single = False
+            elif text[i] == "'" and i + 1 < len(text) and text[i + 1] == "'":
+                i += 1
+            i += 1
+            continue
+        if in_double:
+            if text[i] == '"' and (i == 0 or text[i - 1] != "\\"):
+                in_double = False
+            i += 1
+            continue
+        if text[i] == "'":
+            in_single = True
+            i += 1
+            continue
+        if text[i] == '"':
+            in_double = True
+            i += 1
+            continue
+        m_case = _case_re.match(text, i)
+        if m_case:
+            depth += 1
+            i = m_case.end()
+            continue
+        m_end = _end_re.match(text, i)
+        if m_end:
+            depth -= 1
+            if depth == 0:
+                return m_end.end()
+            i = m_end.end()
+            continue
+        i += 1
+    return None
+
+
+def _replace_case_expressions_with_null(body: str) -> str:
+    """
+    Replace all CASE...END expressions with NULL. Handles nested CASEs by repeatedly
+    replacing innermost first. Used when error contains CASE and character varying
+    and _fix_case_type_mismatch cannot resolve the type conflict.
+    """
+    _case_re = re.compile(r"\bCASE\b", re.IGNORECASE)
+    result = body
+    changed = True
+    while changed:
+        changed = False
+        m = _case_re.search(result)
+        if not m:
+            break
+        start = m.start()
+        end_pos = _find_case_end(result, start)
+        if end_pos is None:
+            break
+        # Replace this CASE...END with NULL
+        result = result[:start] + "NULL" + result[end_pos:]
+        changed = True
+    return result
+
+
 def _fix_case_type_mismatch(body: str) -> str:
     """
     Fix 'CASE types ... cannot be matched' (varchar/numeric, timestamp/double, etc.)
@@ -5796,6 +5869,26 @@ def execute_view_with_column_retry(
                         current_sql = new_sql
                         continue
             log.warning("[CASE-TYPE] %s: could not apply fix -- giving up", display)
+
+        # --- When error contains CASE and character varying: replace CASE with NULL ---
+        if err and "case" in (err or "").lower() and "character varying" in (err or "").lower():
+            err_key = "case_replace_null"
+            if err_key in seen_errors:
+                log.warning("[CASE-NULL] %s: still failing after CASE->NULL fix -- giving up", display)
+                return False, err, current_sql, removed_columns
+            seen_errors.add(err_key)
+            body = _body_from_create_view_ddl(current_sql)
+            if body and "CASE" in body.upper():
+                fixed_body = _replace_case_expressions_with_null(body)
+                if fixed_body != body:
+                    match = _BODY_FROM_DDL_PATTERN.search(current_sql)
+                    if match:
+                        new_sql = current_sql[:match.start(1)] + fixed_body + current_sql[match.end(1):]
+                        log.info("[CASE-NULL] %s: replacing CASE with NULL (attempt %d)", display, attempt + 1)
+                        removed_columns.append("case->null")
+                        current_sql = new_sql
+                        continue
+            log.warning("[CASE-NULL] %s: could not apply fix -- giving up", display)
 
         # --- Handle "operator does not exist: interval + integer" ---
         if err and "operator does not exist" in (err or "").lower() and "interval" in (err or "").lower() and "integer" in (err or "").lower():

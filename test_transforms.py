@@ -2427,6 +2427,26 @@ class TestFixSignAndExtract:
 
 
 # ===========================================================================
+# _replace_case_expressions_with_null (CASE + character varying -> NULL)
+# ===========================================================================
+class TestReplaceCaseWithNull:
+    def test_simple_case_replaced_with_null(self):
+        body = "SELECT CASE WHEN x = 1 THEN 1 ELSE 0 END FROM t"
+        result = mrv._replace_case_expressions_with_null(body)
+        assert result == "SELECT NULL FROM t"
+
+    def test_nested_case_both_replaced(self):
+        body = "SELECT CASE WHEN a THEN CASE WHEN b THEN 1 ELSE 2 END ELSE 3 END FROM t"
+        result = mrv._replace_case_expressions_with_null(body)
+        assert result == "SELECT NULL FROM t"
+
+    def test_no_case_unchanged(self):
+        body = "SELECT col1, col2 FROM t"
+        result = mrv._replace_case_expressions_with_null(body)
+        assert result == body
+
+
+# ===========================================================================
 # _fix_interval_plus_integer, _fix_interval_to_numeric
 # ===========================================================================
 class TestFixIntervalFixes:
