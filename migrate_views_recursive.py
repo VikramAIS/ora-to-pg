@@ -226,14 +226,274 @@ def _first_statement_only(sql: str) -> str:
     return sql
 
 
-def _remove_outer_join_plus(text: str) -> str:
-    """Remove Oracle (+) outer join notation so parsers and PG don't error.
-    WARNING: This converts outer joins to inner joins, which changes query semantics.
-    A SQL comment is injected at the top when (+) is detected to alert reviewers.
+# Pattern for Oracle (+) on a column reference: ident or ident.ident
+_ORACLE_PLUS_PAT = re.compile(
+    r"([a-zA-Z_][a-zA-Z0-9_$#.]*(?:\.[a-zA-Z_][a-zA-Z0-9_$#]*)*)\s*"
+    r"\(\s*\+\s*\)\s*=\s*"
+    r"([a-zA-Z_][a-zA-Z0-9_$#.]*(?:\.[a-zA-Z_][a-zA-Z0-9_$#]*)*)|"
+    r"([a-zA-Z_][a-zA-Z0-9_$#.]*(?:\.[a-zA-Z_][a-zA-Z0-9_$#]*)*)\s*"
+    r"=\s*([a-zA-Z_][a-zA-Z0-9_$#.]*(?:\.[a-zA-Z_][a-zA-Z0-9_$#]*)*)\s*"
+    r"\(\s*\+\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _convert_oracle_outer_join_plus(text: str) -> str:
+    """Convert Oracle (+) legacy outer join to PostgreSQL LEFT/RIGHT JOIN ... ON.
+
+    - a.col = b.col(+)  ->  LEFT JOIN b ON a.col = b.col
+    - a.col(+) = b.col  ->  RIGHT JOIN b ON a.col = b.col
+    Condition in ON (not WHERE) preserves outer join semantics.
+    Falls back to strip + warning on complex cases.
     """
-    if re.search(r"\(\s*\+\s*\)", text):
-        text = "/* WARNING: Oracle (+) outer-join syntax was removed; semantics changed to inner join — review manually */\n" + text
-    return re.sub(r"\(\s*\+\s*\)", "", text, flags=re.IGNORECASE)
+    if not re.search(r"\(\s*\+\s*\)", text):
+        return text
+
+    # Protect string literals so we don't match (+) inside strings
+    parts = re.split(r"('(?:[^']|'')*')", text)
+    result_parts = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            result_parts.append(part)
+            continue
+        result_parts.append(_convert_outer_join_plus_in_fragment(part))
+    return "".join(result_parts)
+
+
+def _convert_outer_join_plus_in_fragment(fragment: str) -> str:
+    """Convert Oracle (+) in a non-string fragment. Falls back to strip if conversion fails."""
+    if "(+)" not in fragment:
+        return fragment
+    try:
+        return _try_convert_outer_join_plus(fragment)
+    except Exception:  # noqa: BLE001
+        # Fallback: strip (+) and inject warning (preserves old behavior for complex cases)
+        out = re.sub(r"\(\s*\+\s*\)", "", fragment, flags=re.IGNORECASE)
+        if "(+)" in fragment:
+            return "/* WARNING: Oracle (+) outer-join syntax was removed; semantics changed to inner join — review manually */\n" + out
+        return out
+
+
+def _try_convert_outer_join_plus(text: str) -> str:
+    """Attempt to convert Oracle (+) to proper LEFT JOIN. Raises on failure."""
+    # Find FROM clause: FROM ... WHERE or FROM ... GROUP BY / ORDER BY / etc.
+    from_match = re.search(
+        r"\bFROM\b\s+",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not from_match:
+        raise ValueError("No FROM clause")
+
+    from_start = from_match.start()
+    # Find end of FROM (WHERE, GROUP BY, ORDER BY, HAVING, etc.)
+    after_from = from_match.end()
+    where_match = re.search(
+        r"\b(WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|OFFSET|FETCH)\b",
+        text[after_from:],
+        re.IGNORECASE,
+    )
+    if not where_match:
+        raise ValueError("No WHERE/GROUP/ORDER after FROM")
+
+    from_end = after_from + where_match.start()
+    from_clause = text[from_start:from_end]
+    rest_before = text[:from_start]
+    rest_after = text[from_end:]
+    where_keyword = where_match.group(1)
+    where_content = ""
+    if where_keyword.upper() in ("WHERE", "HAVING"):
+        after_kw = rest_after[len(where_keyword) :].lstrip()
+        next_kw = re.search(
+            r"\b(GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|OFFSET|FETCH)\b",
+            after_kw,
+            re.IGNORECASE,
+        )
+        if next_kw:
+            where_content = after_kw[: next_kw.start()].strip()
+            rest_after = " " + after_kw[next_kw.start() :]
+        else:
+            where_content = after_kw
+            rest_after = ""
+
+    # Parse outer-join conditions from WHERE
+    # (plus_table, preserved_table, on_cond, join_type) - join_type "LEFT" or "RIGHT" per (+) position
+    join_ons: list[tuple[str, str, str, str]] = []
+    remaining_conditions: list[str] = []
+
+    def _split_conditions(cond: str) -> list[str]:
+        parts: list[str] = []
+        depth = 0
+        curr = []
+        i = 0
+        while i < len(cond):
+            c = cond[i]
+            if c in "([{":
+                depth += 1
+                curr.append(c)
+            elif c in ")]}":
+                depth -= 1
+                curr.append(c)
+            elif c == "'" and (i == 0 or cond[i - 1] != "\\"):
+                j = i + 1
+                while j < len(cond):
+                    if cond[j] == "'" and (j == 0 or cond[j - 1] != "'"):
+                        break
+                    if cond[j] == "''":
+                        j += 2
+                        continue
+                    j += 1
+                curr.append(cond[i : j + 1])
+                i = j
+            elif depth == 0 and cond[i : i + 3].upper() == "AND":
+                if re.match(r"\s*\bAND\b", cond[i:], re.IGNORECASE):
+                    parts.append("".join(curr).strip())
+                    curr = []
+                    i += 3
+                    while i < len(cond) and cond[i] in " \t":
+                        i += 1
+                    i -= 1
+            else:
+                curr.append(c)
+            i += 1
+        if curr:
+            parts.append("".join(curr).strip())
+        return [p for p in parts if p]
+
+    if where_content:
+        conds = _split_conditions(where_content)
+        for c in conds:
+            plus_match = _ORACLE_PLUS_PAT.search(c)
+            if plus_match:
+                if plus_match.group(1) is not None:
+                    # lhs (+) = rhs  →  RIGHT JOIN lhs (plus on left)
+                    lhs_plus, rhs = plus_match.group(1, 2)
+                    plus_table = lhs_plus.split(".")[0] if "." in lhs_plus else lhs_plus
+                    preserved_table = rhs.split(".")[0] if "." in rhs else rhs
+                    on_cond = f"{lhs_plus} = {rhs}"
+                    join_ons.append((plus_table, preserved_table, on_cond, "RIGHT"))
+                else:
+                    # lhs = rhs (+)  →  LEFT JOIN rhs (plus on right)
+                    lhs, rhs_plus = plus_match.group(3, 4)
+                    plus_table = rhs_plus.split(".")[0] if "." in rhs_plus else rhs_plus
+                    preserved_table = lhs.split(".")[0] if "." in lhs else lhs
+                    on_cond = f"{lhs} = {rhs_plus}"
+                    join_ons.append((plus_table, preserved_table, on_cond, "LEFT"))
+            else:
+                remaining_conditions.append(c)
+    else:
+        raise ValueError("No WHERE with conditions")
+
+    if not join_ons:
+        raise ValueError("No outer-join conditions found")
+
+    # Parse FROM list (simple comma-separated tables; no subquery handling)
+    from_body = from_clause[4:].strip()  # skip "FROM"
+    table_exprs: list[str] = []
+    depth = 0
+    curr = []
+    for i, c in enumerate(from_body):
+        if c in "([{":
+            depth += 1
+            curr.append(c)
+        elif c in ")]}":
+            depth -= 1
+            curr.append(c)
+        elif depth == 0 and c == ",":
+            table_exprs.append("".join(curr).strip())
+            curr = []
+        else:
+            curr.append(c)
+    if curr:
+        table_exprs.append("".join(curr).strip())
+
+    def _table_or_alias(expr: str) -> str:
+        """First token (table) or last token (alias) for 'schema.table alias'."""
+        parts = expr.split()
+        return parts[-1] if len(parts) >= 2 else parts[0]
+
+    alias_to_expr: dict[str, str] = {}
+    for te in table_exprs:
+        alias_to_expr[_table_or_alias(te)] = te
+
+    if len(table_exprs) < 2:
+        raise ValueError("Need at least 2 tables for outer join")
+
+    # Group multiple (+) conditions on the same table into one JOIN
+    from collections import OrderedDict
+    grouped_joins: OrderedDict[str, list[tuple[str, str, str, str]]] = OrderedDict()
+    for plus_table, preserved_table, on_cond, join_type in join_ons:
+        key = plus_table if join_type == "LEFT" else preserved_table
+        grouped_joins.setdefault(key, []).append((plus_table, preserved_table, on_cond, join_type))
+
+    # Track which tables are consumed by outer joins
+    consumed_tables: set[str] = set()
+
+    # Build first join
+    first_key = next(iter(grouped_joins))
+    first_group = grouped_joins[first_key]
+    first_plus, first_preserved, first_cond, first_type = first_group[0]
+    all_on_conds = [item[2] for item in first_group]
+    on_clause = " AND ".join(all_on_conds)
+
+    if first_type == "LEFT":
+        driver_alias = first_preserved
+        join_alias = first_plus
+        driver_expr = alias_to_expr.get(driver_alias, driver_alias)
+        join_expr = alias_to_expr.get(join_alias, join_alias)
+        new_from = f"FROM {driver_expr} LEFT JOIN {join_expr} ON {on_clause}"
+    else:
+        driver_alias = first_plus
+        join_alias = first_preserved
+        driver_expr = alias_to_expr.get(driver_alias, driver_alias)
+        join_expr = alias_to_expr.get(join_alias, join_alias)
+        new_from = f"FROM {driver_expr} RIGHT JOIN {join_expr} ON {on_clause}"
+    consumed_tables.add(driver_alias)
+    consumed_tables.add(join_alias)
+
+    # Subsequent outer joins
+    for key in list(grouped_joins.keys())[1:]:
+        group = grouped_joins[key]
+        all_on_conds = [item[2] for item in group]
+        on_clause = " AND ".join(all_on_conds)
+        plus_table = group[0][0]
+        preserved_table = group[0][1]
+        join_type = group[0][3]
+        if join_type == "LEFT":
+            join_expr = alias_to_expr.get(plus_table, plus_table)
+            new_from += f" LEFT JOIN {join_expr} ON {on_clause}"
+            consumed_tables.add(plus_table)
+            consumed_tables.add(preserved_table)
+        else:
+            join_expr = alias_to_expr.get(preserved_table, preserved_table)
+            new_from += f" RIGHT JOIN {join_expr} ON {on_clause}"
+            consumed_tables.add(plus_table)
+            consumed_tables.add(preserved_table)
+
+    # Add remaining tables not involved in any (+) as cross joins (preserves Oracle comma-join)
+    for te in table_exprs:
+        alias = _table_or_alias(te)
+        if alias not in consumed_tables:
+            new_from += f", {te}"
+
+    new_from += " "
+
+    new_where = ""
+    if remaining_conditions:
+        new_where = " WHERE " + " AND ".join(remaining_conditions)
+    new_where += " " + rest_after if rest_after else ""
+
+    return rest_before + new_from + new_where.lstrip()
+
+
+def _remove_outer_join_plus(text: str) -> str:
+    """Convert Oracle (+) legacy outer join to LEFT/RIGHT JOIN based on (+) position.
+
+    - lhs = rhs (+)  ->  LEFT JOIN rhs (keep lhs)
+    - lhs (+) = rhs  ->  RIGHT JOIN rhs (keep rhs)
+    Falls back to strip + WARNING on complex cases.
+    """
+    return _convert_oracle_outer_join_plus(text)
 
 
 def _replace_to_func_for_oracle_parse(
@@ -383,6 +643,36 @@ def rewrite_sql_with_synonyms(
         desired = f"{view_schema.strip()}.{view_name.strip()}".lower()
         out = _REWRITE_VIEW_NAME_PATTERN.sub(lambda m: m.group(1) + desired + m.group(3), out, count=1)
     return out
+
+
+def _find_matching_open_paren(text: str, close_pos: int) -> int | None:
+    """Return index of the '(' that matches the ')' at close_pos, scanning backwards."""
+    if close_pos < 0 or close_pos >= len(text) or text[close_pos] != ")":
+        return None
+    depth = 1
+    i = close_pos - 1
+    in_single = False
+    while i >= 0 and depth > 0:
+        c = text[i]
+        if in_single:
+            if c == "'" and (i == 0 or text[i - 1] != "'"):
+                in_single = False
+            elif c == "'" and i > 0 and text[i - 1] == "'":
+                i -= 1
+            i -= 1
+            continue
+        if c == "'":
+            in_single = True
+            i -= 1
+            continue
+        if c == ")":
+            depth += 1
+        elif c == "(":
+            depth -= 1
+            if depth == 0:
+                return i
+        i -= 1
+    return None
 
 
 def _find_closing_paren(text: str, open_pos: int) -> int | None:
@@ -664,7 +954,13 @@ def _decode_to_case(inner: str) -> str:
     else:
         default = "NULL"
         pairs = list(zip(rest[::2], rest[1::2]))
-    whens = " ".join(f"WHEN {expr} = {s} THEN {r}" for s, r in pairs)
+    def _when_clause(expr: str, search_val: str, result_val: str) -> str:
+        sv = search_val.strip()
+        if sv.upper() == "NULL" or sv in ("''", '""'):
+            return f"WHEN {expr} IS NULL THEN {result_val}"
+        return f"WHEN {expr} = {search_val} THEN {result_val}"
+
+    whens = " ".join(_when_clause(expr, s, r) for s, r in pairs)
     return f"CASE {whens} ELSE {default} END"
 
 
@@ -685,7 +981,7 @@ def _replace_nvl_nvl2_decode_in_body(body: str) -> str:
         if len(args) < 3:
             break
         expr, if_not_null, if_null = args[0].strip(), args[1].strip(), args[2].strip()
-        repl = f"CASE WHEN {expr} IS NOT NULL THEN {if_not_null} ELSE {if_null} END"
+        repl = f"CASE WHEN NULLIF(({expr})::text, '') IS NOT NULL THEN {if_not_null} ELSE {if_null} END"
         body = body[: match.start()] + repl + body[close + 1 :]
     # DECODE(expr, s1, r1, ...) -> CASE WHEN expr = s1 THEN r1 ... ELSE default END
     while True:
@@ -727,7 +1023,7 @@ _TRUNC_DATE_INDICATORS = re.compile(
     re.IGNORECASE,
 )
 _TRUNC_DATE_COLUMN_SUFFIX = re.compile(
-    r"(?:_date|_time|_timestamp|_dt|_ts)\s*$", re.IGNORECASE,
+    r"(?:_date|_time|_timestamp|_dt|_ts|_at|date$|time$)\s*$", re.IGNORECASE,
 )
 
 
@@ -803,6 +1099,48 @@ def _replace_trunc_in_body(body: str) -> str:
     return body
 
 
+def _fix_concat_null_handling(body: str) -> str:
+    """Oracle treats NULL as '' in concatenation (||); PG propagates NULL.
+
+    Wrap non-literal operands of || in COALESCE(..., '') so PG matches Oracle behavior.
+    String literals ('...') and already-wrapped COALESCE calls are skipped.
+    """
+    if "||" not in body:
+        return body
+
+    # Split into string-literal and non-literal parts
+    parts = re.split(r"('(?:[^']|'')*')", body)
+    # Operand pattern: identifier, qualified identifier, function call ending with ),
+    # or a cast expression ending with ::type — basically anything that could be NULL
+    operand_re = re.compile(
+        r"([a-zA-Z_][a-zA-Z0-9_.]*(?:\s*\([^)]*\))?(?:\s*::\s*[a-zA-Z_][a-zA-Z0-9_() ]*)?)"
+        r"\s*\|\|"
+    )
+    rhs_re = re.compile(
+        r"\|\|\s*"
+        r"([a-zA-Z_][a-zA-Z0-9_.]*(?:\s*\([^)]*\))?(?:\s*::\s*[a-zA-Z_][a-zA-Z0-9_() ]*)?)"
+    )
+
+    def _wrap_lhs(m: re.Match) -> str:
+        operand = m.group(1).strip()
+        if operand.upper().startswith("COALESCE"):
+            return m.group(0)
+        return f"COALESCE({operand}, '') ||"
+
+    def _wrap_rhs(m: re.Match) -> str:
+        operand = m.group(1).strip()
+        if operand.upper().startswith("COALESCE"):
+            return m.group(0)
+        return f"|| COALESCE({operand}, '')"
+
+    for i in range(0, len(parts), 2):
+        if "||" not in parts[i]:
+            continue
+        parts[i] = operand_re.sub(_wrap_lhs, parts[i])
+        parts[i] = rhs_re.sub(_wrap_rhs, parts[i])
+    return "".join(parts)
+
+
 def _sub_outside_strings(pattern: str, repl: str, body: str, flags: int = 0) -> str:
     """Run re.sub only on parts of *body* that are outside single-quoted string literals.
 
@@ -822,6 +1160,66 @@ def _replace_oracle_misc_in_body(body: str) -> str:
     body = _sub_outside_strings(r"\bSYSDATE\b", "CURRENT_TIMESTAMP", body, flags=re.IGNORECASE)
     body = _sub_outside_strings(r"\bSYSTIMESTAMP\b", "CURRENT_TIMESTAMP", body, flags=re.IGNORECASE)
     body = _sub_outside_strings(r"\s+MINUS\s+", " EXCEPT ", body, flags=re.IGNORECASE)
+    # Convert ROWNUM conditions to LIMIT before generic ROWNUM replacement.
+    # Patterns: ROWNUM <= N, ROWNUM < N, ROWNUM = N
+    # Handles both AND-chained (middle/end of WHERE) and standalone WHERE conditions.
+    def _is_top_level(body: str, pos: int) -> bool:
+        """Return True if pos is at paren depth 0 (top-level query, not inside a subquery)."""
+        depth = 0
+        in_str = False
+        for i in range(pos):
+            c = body[i]
+            if in_str:
+                if c == "'" and (i + 1 >= len(body) or body[i + 1] != "'"):
+                    in_str = False
+                elif c == "'" and i + 1 < len(body) and body[i + 1] == "'":
+                    pass  # escaped quote
+                continue
+            if c == "'":
+                in_str = True
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+        return depth == 0
+
+    def _extract_rownum_limit(body: str) -> tuple[str, int | None]:
+        """Find and remove a top-level ROWNUM condition, returning (new_body, limit_val).
+        Skips ROWNUM inside subqueries to avoid misplacing LIMIT."""
+        patterns = [
+            (r"\bAND\s+ROWNUM\s*<=\s*(\d+)\b", lambda m: int(m.group(1))),
+            (r"\bAND\s+ROWNUM\s*<\s*(\d+)\b", lambda m: int(m.group(1)) - 1),
+            (r"\bAND\s+ROWNUM\s*=\s*(\d+)\b", lambda m: int(m.group(1))),
+            (r"\bROWNUM\s*<=\s*(\d+)\s+AND\b", lambda m: int(m.group(1))),
+            (r"\bROWNUM\s*<\s*(\d+)\s+AND\b", lambda m: int(m.group(1)) - 1),
+            (r"\bROWNUM\s*=\s*(\d+)\s+AND\b", lambda m: int(m.group(1))),
+        ]
+        for pat, calc in patterns:
+            for m in re.finditer(pat, body, re.IGNORECASE):
+                if _is_top_level(body, m.start()):
+                    return body[:m.start()] + " " + body[m.end():], calc(m)
+
+        sole_patterns = [
+            (r"\bWHERE\s+ROWNUM\s*<=\s*(\d+)\b", lambda m: int(m.group(1))),
+            (r"\bWHERE\s+ROWNUM\s*<\s*(\d+)\b", lambda m: int(m.group(1)) - 1),
+            (r"\bWHERE\s+ROWNUM\s*=\s*(\d+)\b", lambda m: int(m.group(1))),
+        ]
+        for pat, calc in sole_patterns:
+            for m in re.finditer(pat, body, re.IGNORECASE):
+                if not _is_top_level(body, m.start()):
+                    continue
+                after = body[m.end():].lstrip()
+                if not after or re.match(r"^\s*(?:GROUP|ORDER|HAVING|LIMIT|UNION|INTERSECT|EXCEPT|\)|$)", after, re.IGNORECASE):
+                    return body[:m.start()] + " " + body[m.end():], calc(m)
+                else:
+                    rest = re.sub(r"^\s*AND\s+", "", body[m.end():], flags=re.IGNORECASE)
+                    return body[:m.start()] + " WHERE " + rest, calc(m)
+        return body, None
+
+    body, limit_n = _extract_rownum_limit(body)
+    if limit_n is not None:
+        body = body.rstrip() + f" LIMIT {limit_n}"
+    # Convert remaining ROWNUM references to ROW_NUMBER() OVER ()
     body = _sub_outside_strings(r"\bROWNUM\b", "(ROW_NUMBER() OVER ())", body, flags=re.IGNORECASE)
     body = _sub_outside_strings(r"\bLENGTHB\s*\(", "octet_length(", body, flags=re.IGNORECASE)
     # ROWIDTOCHAR(expr) -> (expr)::text  (Oracle ROWID-to-string; PG has no ROWIDTOCHAR)
@@ -1183,10 +1581,23 @@ def _replace_pg_unit_dd_and_substring(body: str) -> str:
         args = _split_top_level_commas(inner)
         if len(args) == 2:
             expr, start_arg = args[0].strip(), args[1].strip()
-            replacement = f"substring(( {expr} )::text FROM ( {start_arg} )::int)"
+            # Oracle SUBSTR(str, -n) = last n chars; SUBSTR(str, 0) = SUBSTR(str, 1)
+            replacement = (
+                f"CASE WHEN ( {start_arg} )::int >= 1 "
+                f"THEN substring(( {expr} )::text FROM ( {start_arg} )::int) "
+                f"WHEN ( {start_arg} )::int = 0 "
+                f"THEN substring(( {expr} )::text FROM 1) "
+                f"ELSE right(( {expr} )::text, abs(( {start_arg} )::int)) END"
+            )
         elif len(args) >= 3:
             expr, start_arg, length_arg = args[0].strip(), args[1].strip(), args[2].strip()
-            replacement = f"substring(( {expr} )::text FROM ( {start_arg} )::int FOR GREATEST(( {length_arg} )::int, 0))"
+            replacement = (
+                f"CASE WHEN ( {start_arg} )::int >= 1 "
+                f"THEN substring(( {expr} )::text FROM ( {start_arg} )::int FOR GREATEST(( {length_arg} )::int, 0)) "
+                f"WHEN ( {start_arg} )::int = 0 "
+                f"THEN substring(( {expr} )::text FROM 1 FOR GREATEST(( {length_arg} )::int, 0)) "
+                f"ELSE substring(( {expr} )::text FROM GREATEST(length(( {expr} )::text) + ( {start_arg} )::int + 1, 1) FOR GREATEST(( {length_arg} )::int, 0)) END"
+            )
         else:
             search_start = close + 1
             continue
@@ -1233,7 +1644,30 @@ def _convert_start_with_connect_by_to_recursive_cte(body: str) -> str:
     """
     Rewrite Oracle hierarchical queries (START WITH ... CONNECT BY) to PostgreSQL recursive CTE.
     Fixes 'syntax error at or near start' and similar. Handles LEVEL, PRIOR, and strips ORDER SIBLINGS BY.
+
+    Also handles CONNECT BY LEVEL <= N (row generator) without START WITH:
+    SELECT ... FROM dual CONNECT BY LEVEL <= N  →  SELECT ... FROM generate_series(1, N) AS level
     """
+    # Handle CONNECT BY LEVEL <= N row generator (no START WITH needed)
+    level_gen_m = re.search(
+        r"\bCONNECT\s+BY\s+(?:NOCYCLE\s+)?LEVEL\s*<=\s*(\d+)",
+        body, re.IGNORECASE,
+    )
+    if level_gen_m and not re.search(r"\bSTART\s+WITH\b", body, re.IGNORECASE):
+        n = level_gen_m.group(1)
+        before = body[: level_gen_m.start()].rstrip()
+        after = body[level_gen_m.end():]
+        # Replace LEVEL references in SELECT with the series value
+        before = re.sub(r"\bLEVEL\b", "gs.level", before, flags=re.IGNORECASE)
+        # Replace FROM dual (or sys.dual) with generate_series
+        before = re.sub(
+            r"\bFROM\s+(?:sys\.)?dual\b",
+            f"FROM generate_series(1, {n}) AS gs(level)",
+            before,
+            flags=re.IGNORECASE,
+        )
+        return before + after
+
     start_with_m = re.search(r"\bSTART\s+WITH\s+", body, re.IGNORECASE)
     if not start_with_m:
         return body
@@ -1272,15 +1706,16 @@ def _convert_start_with_connect_by_to_recursive_cte(body: str) -> str:
     table_alias = (from_m.group(2) or table_ref).strip()
     # Build join condition: PRIOR col_a = col_b -> r.col_a = rcte_t.col_b; col_b = PRIOR col_a -> rcte_t.col_b = r.col_a
     join_cond = connect_by_condition
+    _qual_ident = r"(?:[a-zA-Z_][a-zA-Z0-9_]*\.)*[a-zA-Z_][a-zA-Z0-9_]*"
     join_cond = re.sub(
-        r"\bPRIOR\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_]*)\b",
-        r"r.\1 = rcte_t.\2",
+        r"\bPRIOR\s+(" + _qual_ident + r")\s*=\s*(" + _qual_ident + r")\b",
+        lambda m: f"r.{m.group(1).rsplit('.', 1)[-1]} = rcte_t.{m.group(2).rsplit('.', 1)[-1]}",
         join_cond,
         flags=re.IGNORECASE,
     )
     join_cond = re.sub(
-        r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*PRIOR\s+([a-zA-Z_][a-zA-Z0-9_]*)\b",
-        r"rcte_t.\1 = r.\2",
+        r"\b(" + _qual_ident + r")\s*=\s*PRIOR\s+(" + _qual_ident + r")\b",
+        lambda m: f"rcte_t.{m.group(1).rsplit('.', 1)[-1]} = r.{m.group(2).rsplit('.', 1)[-1]}",
         join_cond,
         flags=re.IGNORECASE,
     )
@@ -1327,40 +1762,143 @@ def _oracle_empty_string_as_null(body: str) -> str:
     body = re.sub(rf"({col_ref})\s*!=\s*''(?!')", r"\1 IS NOT NULL", body, flags=re.IGNORECASE)
     body = re.sub(rf'({col_ref})\s*<>\s*""', r"\1 IS NOT NULL", body, flags=re.IGNORECASE)
     body = re.sub(rf'({col_ref})\s*!=\s*""', r"\1 IS NOT NULL", body, flags=re.IGNORECASE)
-    # Expression result (closing paren) compared with empty string → IS NULL / IS NOT NULL
-    # Handles: COALESCE(col, NULL) = ''  and  (col) = ''  and  func(x) <> ''
-    body = re.sub(r"(\))\s*=\s*''(?!')", r"\1 IS NULL", body)
-    body = re.sub(r'(\))\s*=\s*""', r"\1 IS NULL", body)
-    body = re.sub(r"(\))\s*<>\s*''(?!')", r"\1 IS NOT NULL", body)
-    body = re.sub(r"(\))\s*!=\s*''(?!')", r"\1 IS NOT NULL", body)
-    body = re.sub(r'(\))\s*<>\s*""', r"\1 IS NOT NULL", body)
-    body = re.sub(r'(\))\s*!=\s*""', r"\1 IS NOT NULL", body)
+    # Expression result (closing paren) compared with empty string.
+    # Oracle: (expr) = '' means (expr) IS NULL because '' IS NULL.
+    # PG needs: ((expr) IS NULL OR (expr) = '').  Find the full (expr) via
+    # matching open paren to build the correct expansion.
+    def _expand_expr_eq_empty(body: str, op: str) -> str:
+        """Replace func(...) op '' with proper NULL-or-empty expansion."""
+        pat = re.compile(r"\)\s*" + op + r"\s*(?:''(?!')|\"\")")
+        offset = 0
+        while True:
+            m = pat.search(body, offset)
+            if not m:
+                break
+            close_pos = m.start()
+            open_pos = _find_matching_open_paren(body, close_pos)
+            if open_pos is None:
+                offset = m.end()
+                continue
+            # Include the function/expression name before the opening paren
+            prefix_m = re.search(r"[a-zA-Z_][a-zA-Z0-9_.]*\s*$", body[:open_pos])
+            start_pos = prefix_m.start() if prefix_m else open_pos
+            expr = body[start_pos:close_pos + 1]
+            if op in ("=",):
+                replacement = f"({expr} IS NULL OR {expr} = '')"
+            else:
+                replacement = f"({expr} IS NOT NULL AND {expr} <> '')"
+            body = body[:start_pos] + replacement + body[m.end():]
+            offset = start_pos + len(replacement)
+        return body
+
+    body = _expand_expr_eq_empty(body, "=")
+    body = _expand_expr_eq_empty(body, "<>")
+    body = _expand_expr_eq_empty(body, "!=")
     # Oracle '' IS NULL, so THEN '' / ELSE '' should become THEN NULL / ELSE NULL
     body = re.sub(r"\bTHEN\s+''(?!')", "THEN NULL", body, flags=re.IGNORECASE)
     body = re.sub(r"\bELSE\s+''(?!')", "ELSE NULL", body, flags=re.IGNORECASE)
     # Oracle '' IS NULL: replace '' as a function/COALESCE argument.
     # Pattern: comma followed by '' followed by ')' or ',' (end/next arg).
     # (?!') prevents matching '' inside longer strings like 'it''s'.
-    # This prevents COALESCE(numeric_col, '') from resolving as text type,
-    # which would break comparisons like  bigint_col = COALESCE(..., '')
-    body = re.sub(r",\s*''(?!')\s*(?=[),])", ", NULL", body)
+    # Skip NULLIF(expr, '') — NULLIF needs '' to detect empty strings as null.
+    def _is_inside_nullif(body: str, pos: int) -> bool:
+        """Check if pos is inside a NULLIF(...) call by scanning backwards for unmatched NULLIF(."""
+        depth = 0
+        i = pos - 1
+        while i >= 0:
+            if body[i] == ")":
+                depth += 1
+            elif body[i] == "(":
+                if depth == 0:
+                    prefix = body[:i].rstrip()
+                    if re.search(r"\bNULLIF$", prefix, re.IGNORECASE):
+                        return True
+                    return False
+                depth -= 1
+            i -= 1
+        return False
+
+    def _comma_empty_to_null(m: re.Match) -> str:
+        if _is_inside_nullif(body, m.start()):
+            return m.group(0)
+        return ", NULL"
+    body = re.compile(r",\s*''(?!')\s*(?=[),])").sub(_comma_empty_to_null, body)
+    # Oracle IN ('', 'val') — '' is NULL in Oracle so IN ('', 'val') matches NULL or 'val'.
+    # In PG, '' is a real value. Convert '' inside IN lists to NULL.
+    # Match IN (...) and replace standalone '' with NULL inside the list.
+    body = re.sub(r"\bIN\s*\(\s*''(?!')", "IN (NULL", body, flags=re.IGNORECASE)
     return body
+
+
+_IS_NULL_SKIP_KEYWORDS = frozenset({
+    "not", "and", "or", "where", "having", "on", "when", "then", "else",
+    "end", "case", "select", "from", "join", "left", "right", "inner",
+    "outer", "full", "cross", "group", "order", "by", "as", "in", "between",
+    "like", "exists", "any", "all", "some", "distinct", "limit", "offset",
+    "fetch", "union", "intersect", "except", "null", "true", "false",
+    "coalesce", "nullif", "cast", "create", "replace", "view", "force",
+})
+
+
+def _fix_is_null_for_empty_string(body: str) -> str:
+    """Oracle: col IS NULL also matches ''; PostgreSQL does not.
+
+    Type-safe: uses ``col::text = ''`` and ``col::text <> ''`` so the expansion
+    works for both text and numeric columns (casting to text never errors).
+    Skips SQL keywords and already-wrapped expressions.
+    Only modifies non-string-literal parts of the body.
+    """
+    col_ref_pat = re.compile(
+        r"\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s+IS\s+NOT\s+NULL\b",
+        re.IGNORECASE,
+    )
+
+    def _replace_is_not_null(m: re.Match) -> str:
+        col = m.group(1)
+        if col.lower() in _IS_NULL_SKIP_KEYWORDS:
+            return m.group(0)
+        return f"({col} IS NOT NULL AND {col}::text <> '')"
+
+    col_ref_pat2 = re.compile(
+        r"\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s+IS\s+NULL\b(?!\s*(?:OR|AND)\s*\1\s*(?:=|<>|::text\s*(?:=|<>))\s*'')",
+        re.IGNORECASE,
+    )
+
+    def _replace_is_null(m: re.Match) -> str:
+        col = m.group(1)
+        if col.lower() in _IS_NULL_SKIP_KEYWORDS:
+            return m.group(0)
+        return f"({col} IS NULL OR {col}::text = '')"
+
+    # Apply only to non-string-literal parts
+    parts = re.split(r"('(?:[^']|'')*')", body)
+    for i in range(0, len(parts), 2):
+        parts[i] = col_ref_pat.sub(_replace_is_not_null, parts[i])
+        parts[i] = col_ref_pat2.sub(_replace_is_null, parts[i])
+    return "".join(parts)
 
 
 def _fix_null_comparisons(body: str) -> str:
     """Oracle allows = NULL and <> NULL; PostgreSQL requires IS NULL / IS NOT NULL.
     Convert: column = NULL -> column IS NULL, column <> NULL / != NULL -> column IS NOT NULL.
     Handles: col = NULL, a.b = NULL, (expr) = NULL.
+    Only modifies non-string-literal parts of the body.
     """
     col_ref = r"[a-zA-Z_][a-zA-Z0-9_.]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*"
-    body = re.sub(rf"\b({col_ref})\s*=\s*NULL\b", r"\1 IS NULL", body, flags=re.IGNORECASE)
-    body = re.sub(rf"\b({col_ref})\s*<>\s*NULL\b", r"\1 IS NOT NULL", body, flags=re.IGNORECASE)
-    body = re.sub(rf"\b({col_ref})\s*!=\s*NULL\b", r"\1 IS NOT NULL", body, flags=re.IGNORECASE)
-    # (expr) = NULL -> (expr) IS NULL (match ) = NULL where ) closes the expr)
-    body = re.sub(r"\)\s*=\s*NULL\b", ") IS NULL", body, flags=re.IGNORECASE)
-    body = re.sub(r"\)\s*<>\s*NULL\b", ") IS NOT NULL", body, flags=re.IGNORECASE)
-    body = re.sub(r"\)\s*!=\s*NULL\b", ") IS NOT NULL", body, flags=re.IGNORECASE)
-    return body
+
+    def _apply(text: str) -> str:
+        text = re.sub(rf"\b({col_ref})\s*=\s*NULL\b", r"\1 IS NULL", text, flags=re.IGNORECASE)
+        text = re.sub(rf"\b({col_ref})\s*<>\s*NULL\b", r"\1 IS NOT NULL", text, flags=re.IGNORECASE)
+        text = re.sub(rf"\b({col_ref})\s*!=\s*NULL\b", r"\1 IS NOT NULL", text, flags=re.IGNORECASE)
+        text = re.sub(r"\)\s*=\s*NULL\b", ") IS NULL", text, flags=re.IGNORECASE)
+        text = re.sub(r"\)\s*<>\s*NULL\b", ") IS NOT NULL", text, flags=re.IGNORECASE)
+        text = re.sub(r"\)\s*!=\s*NULL\b", ") IS NOT NULL", text, flags=re.IGNORECASE)
+        return text
+
+    parts = re.split(r"('(?:[^']|'')*')", body)
+    for i in range(0, len(parts), 2):
+        parts[i] = _apply(parts[i])
+    return "".join(parts)
 
 
 def _empty_string_to_null_for_datetime(body: str) -> str:
@@ -3098,14 +3636,10 @@ def _find_case_end(text: str, case_start: int) -> int | None:
     return None
 
 
-def _replace_case_expressions_with_null(body: str) -> str:
-    """
-    Replace all CASE...END expressions with NULL. Handles nested CASEs by repeatedly
-    replacing innermost first. Used when error contains CASE and character varying
-    and _fix_case_type_mismatch cannot resolve the type conflict.
-    """
+def _replace_case_in_text(text: str) -> str:
+    """Replace all CASE...END in a text fragment with NULL (handles nesting)."""
     _case_re = re.compile(r"\bCASE\b", re.IGNORECASE)
-    result = body
+    result = text
     changed = True
     while changed:
         changed = False
@@ -3116,10 +3650,36 @@ def _replace_case_expressions_with_null(body: str) -> str:
         end_pos = _find_case_end(result, start)
         if end_pos is None:
             break
-        # Replace this CASE...END with NULL
         result = result[:start] + "NULL" + result[end_pos:]
         changed = True
     return result
+
+
+def _replace_case_expressions_with_null(body: str) -> str:
+    """
+    Replace CASE...END expressions with NULL only in SELECT items (not WHERE/ON/HAVING).
+    Preserves filtering predicates to avoid changing row counts.
+    Falls back to full replacement only if SELECT-only replacement doesn't change anything.
+    """
+    bounds_list = _find_all_select_list_bounds(body)
+    if bounds_list:
+        new_body = []
+        prev_end = 0
+        any_changed = False
+        for start, end in bounds_list:
+            new_body.append(body[prev_end:start])
+            select_text = body[start:end]
+            replaced = _replace_case_in_text(select_text)
+            if replaced != select_text:
+                any_changed = True
+            new_body.append(replaced)
+            prev_end = end
+        new_body.append(body[prev_end:])
+        if any_changed:
+            return "".join(new_body)
+    # No CASE found in SELECT lists — return body unchanged to preserve
+    # WHERE/ON/HAVING predicates (replacing CASE there would drop all rows).
+    return body
 
 
 def _fix_case_type_mismatch(body: str) -> str:
@@ -3273,22 +3833,23 @@ def _fix_null_implicit_alias_and_chained_as(body: str) -> str:
 def _fix_group_by_null(body: str) -> str:
     """
     Fix 'non-integer constant in GROUP BY' error. PostgreSQL does not allow NULL
-    as a grouping expression. Remove NULL from GROUP BY lists; if NULL is the
-    only item, use GROUP BY 1 (constant) so all rows form one group.
-    IMPORTANT: Must not remove NULL from SELECT lists (e.g. "SELECT NULL AS col"
-    would become "SELECT AS col"). Use negative lookahead to skip ", NULL" when
-    followed by AS (SELECT list context).
+    as a grouping expression. Remove NULL only from GROUP BY lists.
+    If NULL is the only item, use GROUP BY 1 so all rows form one group.
     """
-    # Remove ", NULL" but NOT when NULL is part of "NULL AS alias" (SELECT list)
-    body = re.sub(r",\s*NULL\b(?!\s+AS\b)", "", body, flags=re.IGNORECASE)
-    # Remove "NULL, " but NOT when part of "SELECT NULL AS alias"
-    body = re.sub(r"(?<!\bSELECT\s)NULL\s*,\s*", "", body, flags=re.IGNORECASE)
-    # Replace standalone "GROUP BY NULL" with "GROUP BY 1"
+    def _clean_group_by(m: re.Match) -> str:
+        prefix = m.group(1)
+        items = m.group(2)
+        cleaned = [item.strip() for item in items.split(",")
+                    if item.strip().upper() != "NULL"]
+        if not cleaned:
+            return prefix + "1"
+        return prefix + ", ".join(cleaned)
+
     body = re.sub(
-        r"GROUP\s+BY\s+NULL\s*(?=\s+(?:HAVING|ORDER|LIMIT|OFFSET|\))|$)",
-        "GROUP BY 1 ",
+        r"(GROUP\s+BY\s+)(.*?)(?=\s+HAVING\b|\s+ORDER\b|\s+LIMIT\b|\s+OFFSET\b|\s+UNION\b|\s+INTERSECT\b|\s+EXCEPT\b|\s*\)|\s*$)",
+        _clean_group_by,
         body,
-        flags=re.IGNORECASE,
+        flags=re.IGNORECASE | re.DOTALL,
     )
     return body
 
@@ -3555,6 +4116,7 @@ def normalize_view_script(
             body = _norm_step("trunc", _replace_trunc_in_body, body)
             body = _norm_step("pg_unit_dd_substring", _replace_pg_unit_dd_and_substring, body)
             body = _norm_step("oracle_misc", _replace_oracle_misc_in_body, body)
+            body = _norm_step("concat_null_handling", _fix_concat_null_handling, body)
             body = _norm_step("oracle_sequence_refs", _replace_oracle_sequence_refs, body)
             body = _norm_step("rowid_to_ctid", _replace_rowid_to_ctid, body)
             body = _norm_step("userenv", _replace_userenv_to_postgres, body)
@@ -3582,6 +4144,7 @@ def normalize_view_script(
             body = _norm_step("limit_comma_syntax", _fix_limit_comma_syntax, body)
             body = _norm_step("empty_string_as_null", _oracle_empty_string_as_null, body)
             body = _norm_step("null_comparisons", _fix_null_comparisons, body)
+            body = _norm_step("fix_is_null_for_empty_string", _fix_is_null_for_empty_string, body)
             body = _norm_step("empty_string_to_null_datetime", _empty_string_to_null_for_datetime, body)
             body = _norm_step("fix_null_implicit_alias_and_chained_as", _fix_null_implicit_alias_and_chained_as, body)
             body = _norm_step("remove_quotes_from_columns", _remove_quotes_from_columns, body)
@@ -4306,8 +4869,8 @@ def _remove_column_references(sql: str, qualifier: str, col: str) -> Optional[st
                 remove_end = cond_end + (and_m.end() if and_m else 0)
                 sql = sql[:m_on.end()] + sql[remove_end:]
             else:
-                # Only ON condition — replace with ON TRUE
-                sql = sql[:m_on.end()] + 'TRUE' + sql[cond_end:]
+                # Only ON condition — replace with ON FALSE to avoid cartesian product
+                sql = sql[:m_on.end()] + 'FALSE' + sql[cond_end:]
             log.debug("[COL-REMOVE] Removed ON condition: %s", cond_text.strip()[:120])
             break
     # Also remove "AND col_ref = ..." inside ON clauses
@@ -4594,10 +5157,21 @@ def _replace_function_with_null_and_alias(sql: str, func_name: str) -> Optional[
     header = create_match.group(1)
     body = create_match.group(2)
 
-    # Step 1: Global replace of func(...) with NULL everywhere (SELECT, WHERE, ON, subqueries, UNION)
+    # Step 1: Replace func(...) with NULL everywhere (SELECT, WHERE, ON, subqueries, UNION)
     body = _replace_function_call_with_null(body, func_name)
     if body == create_match.group(2):
         return None
+
+    # Step 1b: Clean up WHERE/ON conditions that now have NULL comparisons
+    # NULL = expr or expr = NULL is always UNKNOWN → remove that condition to preserve rows
+    # AND-chained: remove the dead condition; sole condition: remove WHERE clause
+    body = re.sub(r"\bNULL\s*(?:=|<>|!=|<|>|<=|>=)\s*[^,\s)]+\s+AND\s+", "", body, flags=re.IGNORECASE)
+    body = re.sub(r"\s+AND\s+NULL\s*(?:=|<>|!=|<|>|<=|>=)\s*[^,\s)]+", "", body, flags=re.IGNORECASE)
+    body = re.sub(r"[^,\s(]+\s*(?:=|<>|!=|<|>|<=|>=)\s*NULL\b\s+AND\s+", "", body, flags=re.IGNORECASE)
+    body = re.sub(r"\s+AND\s+[^,\s(]+\s*(?:=|<>|!=|<|>|<=|>=)\s*NULL\b", "", body, flags=re.IGNORECASE)
+    # If WHERE is now empty or just whitespace, remove it
+    body = re.sub(r"\bWHERE\s+(?=GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|OFFSET|FETCH|UNION|INTERSECT|EXCEPT|\)|$)",
+                  "", body, flags=re.IGNORECASE)
 
     # Step 2: Add aliases for SELECT items that are NULL-like without explicit alias
     bounds_list = _find_all_select_list_bounds(body)
