@@ -7106,6 +7106,7 @@ class RecursiveViewMigrator:
         no_qualify: bool = False,
         create_schemas: bool = False,
         remove_where: bool = False,
+        max_passes: int = 5,
         output_dir: Optional[Path] = None,
     ):
         self.oracle_conn = oracle_conn
@@ -7117,6 +7118,7 @@ class RecursiveViewMigrator:
         self.no_qualify = no_qualify
         self.create_schemas = create_schemas
         self.remove_where = remove_where
+        self.max_passes = max_passes
         self.output_dir = output_dir
 
         self.created: set[ViewKey] = set()
@@ -8016,9 +8018,8 @@ class RecursiveViewMigrator:
         self.view_list_keys = {((s or "").lower(), (v or "").lower()) for s, v in view_list if (s or v)}
         remaining = list(view_list)
         pass_num = 0
-        max_passes = 5
 
-        while remaining and pass_num < max_passes:
+        while remaining and pass_num < self.max_passes:
             pass_num += 1
             log.info("=== Pass %d: %d view(s) remaining ===", pass_num, len(remaining))
             print(f"\n--- Pass {pass_num}: {len(remaining)} view(s) to process ---", flush=True)
@@ -8061,7 +8062,6 @@ class RecursiveViewMigrator:
             )
 
             remaining = still_failing
-            break  # Single pass only; no retry cycles
 
         # Mark anything still remaining as failed
         for schema, view_name in remaining if remaining else []:
@@ -8258,6 +8258,13 @@ def main() -> None:
         "--remove-where",
         action="store_true",
         help="On 'character varying' error: remove WHERE clause and retry",
+    )
+    parser.add_argument(
+        "--max-passes",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Max passes over the view list for dependency resolution (default: 5)",
     )
     args = parser.parse_args()
 
@@ -8496,6 +8503,7 @@ def main() -> None:
         no_qualify=args.no_qualify,
         create_schemas=args.create_schemas,
         remove_where=args.remove_where,
+        max_passes=args.max_passes,
         output_dir=output_dir,
     )
 
