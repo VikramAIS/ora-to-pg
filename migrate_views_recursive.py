@@ -227,13 +227,17 @@ def _first_statement_only(sql: str) -> str:
 
 
 # Pattern for Oracle (+) on a column reference: ident or ident.ident
+_IDENT = r"[a-zA-Z_][a-zA-Z0-9_$#.]*(?:\.[a-zA-Z_][a-zA-Z0-9_$#]*)*"
+_VALUE = r"(?:" + _IDENT + r"|'[^']*'|[0-9]+(?:\.[0-9]+)?|NULL)"
 _ORACLE_PLUS_PAT = re.compile(
-    r"([a-zA-Z_][a-zA-Z0-9_$#.]*(?:\.[a-zA-Z_][a-zA-Z0-9_$#]*)*)\s*"
-    r"\(\s*\+\s*\)\s*=\s*"
-    r"([a-zA-Z_][a-zA-Z0-9_$#.]*(?:\.[a-zA-Z_][a-zA-Z0-9_$#]*)*)|"
-    r"([a-zA-Z_][a-zA-Z0-9_$#.]*(?:\.[a-zA-Z_][a-zA-Z0-9_$#]*)*)\s*"
-    r"=\s*([a-zA-Z_][a-zA-Z0-9_$#.]*(?:\.[a-zA-Z_][a-zA-Z0-9_$#]*)*)\s*"
-    r"\(\s*\+\s*\)",
+    # Alt 1: lhs(+) = rhs_ident
+    r"(" + _IDENT + r")\s*\(\s*\+\s*\)\s*=\s*(" + _IDENT + r")|"
+    # Alt 2: lhs_ident = rhs(+)
+    r"(" + _IDENT + r")\s*=\s*(" + _IDENT + r")\s*\(\s*\+\s*\)|"
+    # Alt 3: lhs(+) = literal/number/NULL (filter on outer-joined table)
+    r"(" + _IDENT + r")\s*\(\s*\+\s*\)\s*=\s*(" + _VALUE + r")|"
+    # Alt 4: literal/number/NULL = rhs(+) (filter on outer-joined table)
+    r"(" + _VALUE + r")\s*=\s*(" + _IDENT + r")\s*\(\s*\+\s*\)",
     re.IGNORECASE,
 )
 
@@ -248,16 +252,10 @@ def _convert_oracle_outer_join_plus(text: str) -> str:
     """
     if not re.search(r"\(\s*\+\s*\)", text):
         return text
-
-    # Protect string literals so we don't match (+) inside strings
-    parts = re.split(r"('(?:[^']|'')*')", text)
-    result_parts = []
-    for i, part in enumerate(parts):
-        if i % 2 == 1:
-            result_parts.append(part)
-            continue
-        result_parts.append(_convert_outer_join_plus_in_fragment(part))
-    return "".join(result_parts)
+    # Process the full text including string literals, since (+) conditions
+    # may compare against string literals (e.g., look2.type(+) = 'VALUE').
+    # The (+) pattern itself is extremely unlikely inside string literals.
+    return _convert_outer_join_plus_in_fragment(text)
 
 
 def _convert_outer_join_plus_in_fragment(fragment: str) -> str:
@@ -360,25 +358,40 @@ def _try_convert_outer_join_plus(text: str) -> str:
             parts.append("".join(curr).strip())
         return [p for p in parts if p]
 
+    # Collect filter conditions: ident(+) = literal — these attach to an existing join's ON clause
+    filter_on_conds: list[tuple[str, str]] = []  # (plus_table_lower, on_cond)
+
     if where_content:
         conds = _split_conditions(where_content)
         for c in conds:
             plus_match = _ORACLE_PLUS_PAT.search(c)
             if plus_match:
                 if plus_match.group(1) is not None:
-                    # lhs (+) = rhs  →  RIGHT JOIN lhs (plus on left)
+                    # Alt 1: lhs(+) = rhs_ident → RIGHT JOIN
                     lhs_plus, rhs = plus_match.group(1, 2)
                     plus_table = lhs_plus.split(".")[0] if "." in lhs_plus else lhs_plus
                     preserved_table = rhs.split(".")[0] if "." in rhs else rhs
                     on_cond = f"{lhs_plus} = {rhs}"
                     join_ons.append((plus_table, preserved_table, on_cond, "RIGHT"))
-                else:
-                    # lhs = rhs (+)  →  LEFT JOIN rhs (plus on right)
+                elif plus_match.group(3) is not None:
+                    # Alt 2: lhs = rhs(+) → LEFT JOIN
                     lhs, rhs_plus = plus_match.group(3, 4)
                     plus_table = rhs_plus.split(".")[0] if "." in rhs_plus else rhs_plus
                     preserved_table = lhs.split(".")[0] if "." in lhs else lhs
                     on_cond = f"{lhs} = {rhs_plus}"
                     join_ons.append((plus_table, preserved_table, on_cond, "LEFT"))
+                elif plus_match.group(5) is not None:
+                    # Alt 3: ident(+) = literal/number/NULL — filter on plus table
+                    lhs_plus, rhs_val = plus_match.group(5, 6)
+                    plus_table = lhs_plus.split(".")[0] if "." in lhs_plus else lhs_plus
+                    filter_on_conds.append((plus_table.lower(), f"{lhs_plus} = {rhs_val}"))
+                elif plus_match.group(7) is not None:
+                    # Alt 4: literal/number/NULL = ident(+) — filter on plus table
+                    lhs_val, rhs_plus = plus_match.group(7, 8)
+                    plus_table = rhs_plus.split(".")[0] if "." in rhs_plus else rhs_plus
+                    filter_on_conds.append((plus_table.lower(), f"{lhs_val} = {rhs_plus}"))
+                else:
+                    remaining_conditions.append(c)
             else:
                 remaining_conditions.append(c)
     else:
@@ -412,9 +425,10 @@ def _try_convert_outer_join_plus(text: str) -> str:
         parts = expr.split()
         return parts[-1] if len(parts) >= 2 else parts[0]
 
+    # Case-insensitive alias→expression map (Oracle identifiers are case-insensitive)
     alias_to_expr: dict[str, str] = {}
     for te in table_exprs:
-        alias_to_expr[_table_or_alias(te)] = te
+        alias_to_expr[_table_or_alias(te).lower()] = te
 
     if len(table_exprs) < 2:
         raise ValueError("Need at least 2 tables for outer join")
@@ -423,30 +437,39 @@ def _try_convert_outer_join_plus(text: str) -> str:
     from collections import OrderedDict
     grouped_joins: OrderedDict[str, list[tuple[str, str, str, str]]] = OrderedDict()
     for plus_table, preserved_table, on_cond, join_type in join_ons:
-        key = plus_table if join_type == "LEFT" else preserved_table
+        key = (plus_table if join_type == "LEFT" else preserved_table).lower()
         grouped_joins.setdefault(key, []).append((plus_table, preserved_table, on_cond, join_type))
 
-    # Track which tables are consumed by outer joins
+    # Collect extra ON-clause filters (ident(+) = literal) keyed by plus_table
+    extra_on_filters: dict[str, list[str]] = {}
+    for plus_tbl_lower, on_cond in filter_on_conds:
+        extra_on_filters.setdefault(plus_tbl_lower, []).append(on_cond)
+
+    def _build_on_clause(group_key: str, group: list) -> str:
+        conds = [item[2] for item in group]
+        conds.extend(extra_on_filters.get(group_key, []))
+        return " AND ".join(conds)
+
+    # Track which tables are consumed by outer joins (all lowercase for matching)
     consumed_tables: set[str] = set()
 
     # Build first join
     first_key = next(iter(grouped_joins))
     first_group = grouped_joins[first_key]
     first_plus, first_preserved, first_cond, first_type = first_group[0]
-    all_on_conds = [item[2] for item in first_group]
-    on_clause = " AND ".join(all_on_conds)
+    on_clause = _build_on_clause(first_key, first_group)
 
     if first_type == "LEFT":
-        driver_alias = first_preserved
-        join_alias = first_plus
-        driver_expr = alias_to_expr.get(driver_alias, driver_alias)
-        join_expr = alias_to_expr.get(join_alias, join_alias)
+        driver_alias = first_preserved.lower()
+        join_alias = first_plus.lower()
+        driver_expr = alias_to_expr.get(driver_alias, first_preserved)
+        join_expr = alias_to_expr.get(join_alias, first_plus)
         new_from = f"FROM {driver_expr} LEFT JOIN {join_expr} ON {on_clause}"
     else:
-        driver_alias = first_plus
-        join_alias = first_preserved
-        driver_expr = alias_to_expr.get(driver_alias, driver_alias)
-        join_expr = alias_to_expr.get(join_alias, join_alias)
+        driver_alias = first_plus.lower()
+        join_alias = first_preserved.lower()
+        driver_expr = alias_to_expr.get(driver_alias, first_plus)
+        join_expr = alias_to_expr.get(join_alias, first_preserved)
         new_from = f"FROM {driver_expr} RIGHT JOIN {join_expr} ON {on_clause}"
     consumed_tables.add(driver_alias)
     consumed_tables.add(join_alias)
@@ -454,25 +477,24 @@ def _try_convert_outer_join_plus(text: str) -> str:
     # Subsequent outer joins
     for key in list(grouped_joins.keys())[1:]:
         group = grouped_joins[key]
-        all_on_conds = [item[2] for item in group]
-        on_clause = " AND ".join(all_on_conds)
+        on_clause = _build_on_clause(key, group)
         plus_table = group[0][0]
         preserved_table = group[0][1]
         join_type = group[0][3]
         if join_type == "LEFT":
-            join_expr = alias_to_expr.get(plus_table, plus_table)
+            join_expr = alias_to_expr.get(plus_table.lower(), plus_table)
             new_from += f" LEFT JOIN {join_expr} ON {on_clause}"
-            consumed_tables.add(plus_table)
-            consumed_tables.add(preserved_table)
+            consumed_tables.add(plus_table.lower())
+            consumed_tables.add(preserved_table.lower())
         else:
-            join_expr = alias_to_expr.get(preserved_table, preserved_table)
+            join_expr = alias_to_expr.get(preserved_table.lower(), preserved_table)
             new_from += f" RIGHT JOIN {join_expr} ON {on_clause}"
-            consumed_tables.add(plus_table)
-            consumed_tables.add(preserved_table)
+            consumed_tables.add(plus_table.lower())
+            consumed_tables.add(preserved_table.lower())
 
     # Add remaining tables not involved in any (+) as cross joins (preserves Oracle comma-join)
     for te in table_exprs:
-        alias = _table_or_alias(te)
+        alias = _table_or_alias(te).lower()
         if alias not in consumed_tables:
             new_from += f", {te}"
 
