@@ -345,6 +345,19 @@ def _try_convert_outer_join_plus(text: str) -> str:
                 i = j
             elif depth == 0 and cond[i : i + 3].upper() == "AND":
                 if re.match(r"\s*\bAND\b", cond[i:], re.IGNORECASE):
+                    # Don't split on AND when it's part of BETWEEN ... AND (e.g. "X BETWEEN a AND b")
+                    curr_str = "".join(curr)
+                    between_idx = curr_str.upper().rfind("BETWEEN")
+                    if between_idx >= 0:
+                        after_between = curr_str[between_idx:]
+                        if " AND " not in after_between.upper():
+                            # This AND pairs with BETWEEN; absorb it into curr, don't split
+                            curr.append(cond[i : i + 3])
+                            i += 3
+                            while i < len(cond) and cond[i] in " \t":
+                                curr.append(cond[i])
+                                i += 1
+                            continue
                     parts.append("".join(curr).strip())
                     curr = []
                     i += 3
@@ -393,7 +406,22 @@ def _try_convert_outer_join_plus(text: str) -> str:
                 else:
                     remaining_conditions.append(c)
             else:
-                remaining_conditions.append(c)
+                # Lookup type filters: e.g. SYSDATE BETWEEN tbl.col(+) AND NVL(tbl.col2(+), ...)
+                # Move into ON clause to preserve outer-join semantics (doc: "Lookup filters in WHERE moved into ON")
+                if "(+)" in c and "BETWEEN" in c.upper():
+                    # Extract plus_table from first ident(+) in condition
+                    plus_tbl_m = re.search(
+                        r"([a-zA-Z_][a-zA-Z0-9_]*)\s*\.\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\(\s*\+\s*\)",
+                        c, re.IGNORECASE,
+                    )
+                    if plus_tbl_m:
+                        plus_table = plus_tbl_m.group(1)
+                        cond_stripped = re.sub(r"\s*\(\s*\+\s*\)", "", c, flags=re.IGNORECASE)
+                        filter_on_conds.append((plus_table.lower(), cond_stripped))
+                    else:
+                        remaining_conditions.append(c)
+                else:
+                    remaining_conditions.append(c)
     else:
         raise ValueError("No WHERE with conditions")
 
@@ -920,6 +948,32 @@ def _replace_oracle_to_functions_in_body(body: str) -> str:
     return body
 
 
+def _simplify_round_trunc_zero(body: str) -> str:
+    """ROUND(TRUNC(...), 0) → TRUNC(...). Doc: 'ROUND(TRUNC(...),0)' → ROUND() or date arithmetic directly."""
+    pattern = re.compile(r"\bROUND\s*\(", re.IGNORECASE)
+    search_start = 0
+    while True:
+        match = pattern.search(body, search_start)
+        if not match:
+            break
+        start_paren = match.end() - 1
+        close = _find_closing_paren(body, start_paren)
+        if close is None:
+            break
+        inner = body[start_paren + 1 : close].strip()
+        args = _split_top_level_commas(inner)
+        if len(args) >= 2:
+            first, second = args[0].strip(), args[1].strip()
+            if second in ("0", "0.0") and re.match(
+                r"^\s*(?:TRUNC|pg_trunc__)\s*\(", first, re.IGNORECASE
+            ):
+                body = body[: match.start()] + first + body[close + 1 :]
+                search_start = match.start() + len(first)
+                continue
+        search_start = close + 1
+    return body
+
+
 def _replace_oracle_builtin_functions_in_body(body: str) -> str:
     """Replace Oracle built-in/custom functions not in PG: MONTHS_BETWEEN, ADD_MONTHS, ROUND(_,_), LPAD(_,_), ap_round_currency, cs_get_serviced_status."""
     def replace_func(body: str, func_name: str, replacer) -> str:
@@ -1107,8 +1161,11 @@ def _replace_trunc_in_body(body: str) -> str:
                 else:
                     repl = f"date_trunc('day', ({expr})::timestamp)"
         else:
-            # 1-arg TRUNC: use heuristic to decide date vs numeric truncation
-            if _is_trunc_expr_likely_date(expr):
+            # 1-arg TRUNC: TRUNC(SYSDATE) → CURRENT_DATE (doc: "date already truncated in PostgreSQL")
+            expr_upper = expr.strip().upper()
+            if expr_upper in ("SYSDATE", "SYSTIMESTAMP", "CURRENT_TIMESTAMP", "LOCALTIMESTAMP", "CURRENT_DATE"):
+                repl = "CURRENT_DATE"
+            elif _is_trunc_expr_likely_date(expr):
                 repl = f"date_trunc('day', ({expr})::timestamp)"
             else:
                 # Likely numeric TRUNC — PG has trunc(numeric) / trunc(double precision)
@@ -1177,8 +1234,19 @@ def _sub_outside_strings(pattern: str, repl: str, body: str, flags: int = 0) -> 
     return "".join(parts)
 
 
+def _remove_column_plus_minus_zero(body: str) -> str:
+    """Remove Oracle 'column + 0' and 'column - 0' used for implicit cast. PG does implicit casting; + 0 is unnecessary."""
+    def replacer(match: re.Match) -> str:
+        return match.group(1)
+    return _sub_outside_strings(
+        r"(\b[a-zA-Z_][a-zA-Z0-9_.]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*[+-]\s*0\b",
+        replacer, body, flags=re.IGNORECASE,
+    )
+
+
 def _replace_oracle_misc_in_body(body: str) -> str:
     """Oracle→PG: SYSDATE/SYSTIMESTAMP, MINUS→EXCEPT, ROWNUM, INSTR(2-arg)→strpos, LENGTHB→octet_length, RPAD, sequences, etc."""
+    body = _remove_column_plus_minus_zero(body)
     body = _sub_outside_strings(r"\bSYSDATE\b", "CURRENT_TIMESTAMP", body, flags=re.IGNORECASE)
     body = _sub_outside_strings(r"\bSYSTIMESTAMP\b", "CURRENT_TIMESTAMP", body, flags=re.IGNORECASE)
     body = _sub_outside_strings(r"\s+MINUS\s+", " EXCEPT ", body, flags=re.IGNORECASE)
@@ -4134,6 +4202,7 @@ def normalize_view_script(
             body = _norm_step("remove_outer_join_plus", _remove_outer_join_plus, body)
             body = _norm_step("nvl_nvl2_decode", _replace_nvl_nvl2_decode_in_body, body)
             body = _norm_step("oracle_to_functions", _replace_oracle_to_functions_in_body, body)
+            body = _norm_step("round_trunc_zero", _simplify_round_trunc_zero, body)
             body = _norm_step("oracle_builtin_functions", _replace_oracle_builtin_functions_in_body, body)
             body = _norm_step("trunc", _replace_trunc_in_body, body)
             body = _norm_step("pg_unit_dd_substring", _replace_pg_unit_dd_and_substring, body)
