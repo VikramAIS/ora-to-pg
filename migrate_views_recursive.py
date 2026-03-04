@@ -449,23 +449,43 @@ def _try_convert_outer_join_plus(text: str) -> str:
         table_exprs.append("".join(curr).strip())
 
     def _table_or_alias(expr: str) -> str:
-        """First token (table) or last token (alias) for 'schema.table alias'."""
+        """Extract table alias for 'schema.table alias' or 'TABLE1 TABLE2 ALIAS'.
+        Oracle often uses multi-word aliases (e.g. 'PO LOOKUP CODES LC TYPE') where
+        conditions reference LC_TYPE. Return last token, or last two joined with '_'
+        when 3+ tokens, so 'LC TYPE' maps to 'lc_type' and matches condition refs."""
         parts = expr.split()
-        return parts[-1] if len(parts) >= 2 else parts[0]
+        if len(parts) < 2:
+            return parts[0] if parts else ""
+        if len(parts) >= 3:
+            # Try last two tokens joined (e.g. LC TYPE -> lc_type)
+            two_word = f"{parts[-2]}_{parts[-1]}".lower()
+            return two_word
+        return parts[-1].lower()
 
     # Case-insensitive alias→expression map (Oracle identifiers are case-insensitive)
+    # Map both full alias (e.g. lc_type) and last token (e.g. type) for "PO LOOKUP CODES LC TYPE"
+    # so conditions referencing TYPE or LC_TYPE both resolve
     alias_to_expr: dict[str, str] = {}
     for te in table_exprs:
-        alias_to_expr[_table_or_alias(te).lower()] = te
+        alias = _table_or_alias(te)
+        if alias:
+            alias_to_expr[alias.lower()] = te
+        parts = te.split()
+        if len(parts) >= 3:
+            alias_to_expr[parts[-1].lower()] = te
 
     if len(table_exprs) < 2:
         raise ValueError("Need at least 2 tables for outer join")
 
-    # Group multiple (+) conditions on the same table into one JOIN
+    # Group multiple (+) conditions for the SAME two-table join into one JOIN.
+    # Key must be (plus_table, preserved_table) so each distinct outer-joined table
+    # gets its own LEFT/RIGHT JOIN. Previously keyed by preserved_table alone, which
+    # collapsed LC_TYPE, LC_TERMS, ALC1, etc. (all preserving PV) into one group,
+    # emitting only one join and leaving others as inner joins — dropping rows.
     from collections import OrderedDict
-    grouped_joins: OrderedDict[str, list[tuple[str, str, str, str]]] = OrderedDict()
+    grouped_joins: OrderedDict[tuple[str, str], list[tuple[str, str, str, str]]] = OrderedDict()
     for plus_table, preserved_table, on_cond, join_type in join_ons:
-        key = (plus_table if join_type == "LEFT" else preserved_table).lower()
+        key = (plus_table.lower(), preserved_table.lower())
         grouped_joins.setdefault(key, []).append((plus_table, preserved_table, on_cond, join_type))
 
     # Collect extra ON-clause filters (ident(+) = literal) keyed by plus_table
@@ -473,9 +493,9 @@ def _try_convert_outer_join_plus(text: str) -> str:
     for plus_tbl_lower, on_cond in filter_on_conds:
         extra_on_filters.setdefault(plus_tbl_lower, []).append(on_cond)
 
-    def _build_on_clause(group_key: str, group: list) -> str:
+    def _build_on_clause(plus_tbl_lower: str, group: list) -> str:
         conds = [item[2] for item in group]
-        conds.extend(extra_on_filters.get(group_key, []))
+        conds.extend(extra_on_filters.get(plus_tbl_lower, []))
         return " AND ".join(conds)
 
     # Track which tables are consumed by outer joins (all lowercase for matching)
@@ -485,7 +505,7 @@ def _try_convert_outer_join_plus(text: str) -> str:
     first_key = next(iter(grouped_joins))
     first_group = grouped_joins[first_key]
     first_plus, first_preserved, first_cond, first_type = first_group[0]
-    on_clause = _build_on_clause(first_key, first_group)
+    on_clause = _build_on_clause(first_plus.lower(), first_group)
 
     if first_type == "LEFT":
         driver_alias = first_preserved.lower()
@@ -502,28 +522,31 @@ def _try_convert_outer_join_plus(text: str) -> str:
     consumed_tables.add(driver_alias)
     consumed_tables.add(join_alias)
 
-    # Subsequent outer joins
+    # Subsequent outer joins: always add the optional (plus) table with LEFT JOIN,
+    # since the preserved table is already in the result from earlier joins.
     for key in list(grouped_joins.keys())[1:]:
         group = grouped_joins[key]
-        on_clause = _build_on_clause(key, group)
-        plus_table = group[0][0]
+        plus_tbl = group[0][0]
         preserved_table = group[0][1]
-        join_type = group[0][3]
-        if join_type == "LEFT":
-            join_expr = alias_to_expr.get(plus_table.lower(), plus_table)
-            new_from += f" LEFT JOIN {join_expr} ON {on_clause}"
-            consumed_tables.add(plus_table.lower())
-            consumed_tables.add(preserved_table.lower())
-        else:
-            join_expr = alias_to_expr.get(preserved_table.lower(), preserved_table)
-            new_from += f" RIGHT JOIN {join_expr} ON {on_clause}"
-            consumed_tables.add(plus_table.lower())
-            consumed_tables.add(preserved_table.lower())
+        on_clause = _build_on_clause(plus_tbl.lower(), group)
+        join_expr = alias_to_expr.get(plus_tbl.lower(), plus_tbl)
+        new_from += f" LEFT JOIN {join_expr} ON {on_clause}"
+        consumed_tables.add(plus_tbl.lower())
+        consumed_tables.add(preserved_table.lower())
 
     # Add remaining tables not involved in any (+) as cross joins (preserves Oracle comma-join)
+    # A table is consumed if its alias (or last token for multi-word) matches consumed_tables
+    def _is_consumed(texpr: str) -> bool:
+        a = _table_or_alias(texpr).lower()
+        if a in consumed_tables:
+            return True
+        parts = texpr.split()
+        if len(parts) >= 3 and parts[-1].lower() in consumed_tables:
+            return True  # e.g. "LC TYPE" ref'd as "TYPE" in condition
+        return False
+
     for te in table_exprs:
-        alias = _table_or_alias(te).lower()
-        if alias not in consumed_tables:
+        if not _is_consumed(te):
             new_from += f", {te}"
 
     new_from += " "
